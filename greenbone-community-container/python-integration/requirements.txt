@@ -1,0 +1,5 @@
+python-gvm
+prometheus_client
+lxml
+paramiko
+gvm-tools

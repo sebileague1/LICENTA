@@ -1,0 +1,9 @@
+FROM python:3.11-slim
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY openvas_exporter.py .
+COPY soar_engine.py .
+EXPOSE 8000
+CMD ["python", "openvas_exporter.py"]
