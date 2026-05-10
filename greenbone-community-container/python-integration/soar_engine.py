@@ -9,11 +9,12 @@ VALID_TRIGGER_IPS = [
     "172.17.0.2",       # Metasploitable2 direct
     "172.19.0.1",       # Gateway bridge retea Greenbone (NOU)
     "192.168.128.181",  # Ubuntu host fizic PC nou
+    "172.19.0.100",     # metasploidable2 ip static
 ]
 
-# === Conectare DIRECTA la Metasploitable2 ===
-SSH_HOST    = "192.168.128.181"
-SSH_PORT    = 2222
+# === Conectare DIRECTA la Metasploitable2 (prin reteaua interna Docker) ===
+SSH_HOST    = "172.19.0.100" # Folosim IP-ul intern de container
+SSH_PORT    = 22             # Folosim portul standard SSH din container
 TARGET_USER = "msfadmin"
 TARGET_PASS = "msfadmin"
 
@@ -107,4 +108,3 @@ def trigger_remediation(ip_sursa_alerta, vuln_name):
         return "🛡️ **POLITICA SOAR:** Automatizarea pe portul 22 dezactivata (Anti-Lockout)."
 
     return None
-
