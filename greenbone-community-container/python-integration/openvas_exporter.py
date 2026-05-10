@@ -55,7 +55,6 @@ def load_secrets_from_infisical():
                     secrets_url = f"{infisical_url}/api/v3/secrets/raw?workspaceId={project_id}&environment={env}&secretPath=/"
                     secrets_req = urllib.request.Request(secrets_url, headers={'Authorization': f'Bearer {token}'})
                     secrets_resp = json.loads(urllib.request.urlopen(secrets_req, timeout=5).read().decode())
-
                     temp_secrets = secrets_resp.get("secrets", [])
                     if len(temp_secrets) > 0:
                         infisical_secrets = temp_secrets
@@ -77,9 +76,11 @@ def load_secrets_from_infisical():
     else:
         log_msg("[INFISICAL] ⚠️ Variabile lipsa in docker-compose. Folosesc env vars direct.")
 
-    for name in ["DISCORD_WEBHOOK", "HOST_UBUNTU_IP", "HOST_UBUNTU_USER", "HOST_UBUNTU_PASS", "GVMD_USER", "GVMD_PASS", "MRBENNY_ADMIN_KEY", "MRBENNY_HARDWARE_UUID"]:
+    for name in ["DISCORD_WEBHOOK", "HOST_UBUNTU_IP", "HOST_UBUNTU_USER", "HOST_UBUNTU_PASS",
+                 "GVMD_USER", "GVMD_PASS", "MRBENNY_ADMIN_KEY", "MRBENNY_HARDWARE_UUID"]:
         val = os.environ.get(name)
-        if val: secrets[name] = val
+        if val:
+            secrets[name] = val
     log_msg(f"[INFISICAL] ⚠️ Fallback activ: {len(secrets)} secrete locale incarcate.")
     return secrets
 
@@ -90,7 +91,8 @@ def secret(name, default=""): return _SECRETS.get(name, default)
 # METRICI PROMETHEUS
 # =====================================================================
 def create_gauge(name, desc, labels=()):
-    if name in REGISTRY._names_to_collectors: return REGISTRY._names_to_collectors[name]
+    if name in REGISTRY._names_to_collectors:
+        return REGISTRY._names_to_collectors[name]
     return Gauge(name, desc, labels)
 
 VULN_HIGH   = create_gauge('openvas_vulnerabilities_high_total',   'Vulnerabilitati Unice High')
@@ -116,10 +118,10 @@ except Exception as e:
 SOCKET_PATH = '/run/gvmd/gvmd.sock'
 GVMD_USER   = secret("GVMD_USER",   "admin")
 GVMD_PASS   = secret("GVMD_PASS",   "admin")
-DISCORD_WEBHOOK   = secret("DISCORD_WEBHOOK", "")
-HOST_UBUNTU_IP   = secret("HOST_UBUNTU_IP",   "192.168.128.181")
-HOST_UBUNTU_USER = secret("HOST_UBUNTU_USER", "ubuntu24")
-HOST_UBUNTU_PASS = secret("HOST_UBUNTU_PASS", "")
+DISCORD_WEBHOOK      = secret("DISCORD_WEBHOOK", "")
+HOST_UBUNTU_IP       = secret("HOST_UBUNTU_IP",   "192.168.128.181")
+HOST_UBUNTU_USER     = secret("HOST_UBUNTU_USER", "ubuntu24")
+HOST_UBUNTU_PASS     = secret("HOST_UBUNTU_PASS", "")
 MRBENNY_BASE_URL      = "https://projects.opti.ro/tuiasimrbenny/api/v1"
 MRBENNY_ADMIN_KEY     = secret("MRBENNY_ADMIN_KEY",     "adm-tui-311")
 MRBENNY_HARDWARE_UUID = secret("MRBENNY_HARDWARE_UUID", "ov2-master-ubuntu-007")
@@ -136,6 +138,12 @@ DISCORD_LOCK         = threading.Lock()
 DISCORD_MIN_INTERVAL = 1.5
 
 # =====================================================================
+# FIX HIDS — Lock anti race-condition + state management
+# =====================================================================
+QUARANTINE_LOCK  = threading.Lock()
+atacatori_cunoscuti = {}   # ip -> int (count) | "BLOCKED"
+
+# =====================================================================
 # MODUL: MR. BENNY INTEGRATION
 # =====================================================================
 def authenticate_mrbenny():
@@ -143,38 +151,71 @@ def authenticate_mrbenny():
     try:
         req_token = urllib.request.Request(
             f"{MRBENNY_BASE_URL}/install_tokens/generate",
-            data=json.dumps({"agent_type": "OV2", "label": "SOC OV2 Master Ubuntu", "allowed_modes": ["B2"], "notes": "Auto-install"}).encode('utf-8'),
-            headers={'X-Mrbenny-Mode': 'A', 'X-Admin-Key': MRBENNY_ADMIN_KEY, 'Content-Type': 'application/json'}
+            data=json.dumps({
+                "agent_type": "OV2",
+                "label": "SOC OV2 Master Ubuntu",
+                "allowed_modes": ["B2"],
+                "notes": "Auto-install"
+            }).encode('utf-8'),
+            headers={
+                'X-Mrbenny-Mode': 'A',
+                'X-Admin-Key': MRBENNY_ADMIN_KEY,
+                'Content-Type': 'application/json'
+            }
         )
         res_token     = json.loads(urllib.request.urlopen(req_token, timeout=10).read().decode())
         install_token = res_token["data"]["install_token"]
 
         req_sess = urllib.request.Request(
             f"{MRBENNY_BASE_URL}/auth/session",
-            data=json.dumps({"agent_type": "OV2", "hardware_uuid": MRBENNY_HARDWARE_UUID, "install_token": install_token, "agent_version": "2.0", "host_label": "ov2-master"}).encode('utf-8'),
+            data=json.dumps({
+                "agent_type": "OV2",
+                "hardware_uuid": MRBENNY_HARDWARE_UUID,
+                "install_token": install_token,
+                "agent_version": "2.0",
+                "host_label": "ov2-master"
+            }).encode('utf-8'),
             headers={'X-Mrbenny-Mode': 'B2', 'Content-Type': 'application/json'}
         )
         res_sess = json.loads(urllib.request.urlopen(req_sess, timeout=10).read().decode())
         MRBENNY_SESSION_TOKEN = res_sess["data"]["session_token"]
         log_msg("[AUTH] ✅ Autentificare B2 REUSITA!")
         return True
-    except Exception as e: return False
+    except Exception as e:
+        return False
 
 def mrbenny_request(endpoint, method="GET", payload=None):
-    if not MRBENNY_SESSION_TOKEN: return None
-    url     = f"{MRBENNY_BASE_URL}{endpoint}"
-    headers = {'Content-Type': 'application/json', 'User-Agent': 'SOC-OV2-Agent/2.0', 'X-Mrbenny-Mode': 'B2', 'Authorization': f'Bearer {MRBENNY_SESSION_TOKEN}'}
+    if not MRBENNY_SESSION_TOKEN:
+        return None
+    url = f"{MRBENNY_BASE_URL}{endpoint}"
+    headers = {
+        'Content-Type': 'application/json',
+        'User-Agent': 'SOC-OV2-Agent/2.0',
+        'X-Mrbenny-Mode': 'B2',
+        'Authorization': f'Bearer {MRBENNY_SESSION_TOKEN}'
+    }
     data = json.dumps(payload).encode('utf-8') if payload else None
     req  = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=10) as response: return json.loads(response.read().decode())
-    except: return None
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return json.loads(response.read().decode())
+    except:
+        return None
 
 def mrbenny_heartbeat_loop():
     while True:
         if MRBENNY_SESSION_TOKEN:
             uptime  = int(time.time() - AGENT_START_TIME)
-            payload = {"client_event_id": f"hb-ov2-{int(time.time())}", "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "status": "online", "metrics": {"queue_size": 0, "uptime_seconds": uptime, "version": "2.0"}}
+            payload = {
+                "client_event_id": f"hb-ov2-{int(time.time())}",
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "status": "online",
+                "metrics": {
+                    "queue_size": 0,
+                    "uptime_seconds": uptime,
+                    "version": "2.0"
+                }
+            }
             mrbenny_request("/heartbeat", method="POST", payload=payload)
         time.sleep(30)
 
@@ -189,17 +230,29 @@ def mrbenny_ontology_loop():
                 for dev in devices:
                     dev_id = dev.get("mrbenny_device_id")
                     for ident in dev.get("identifiers", []):
-                        if ident.get("type") in ["ip", "ipv4", "ipv6"]: new_map[ident.get("value")] = dev_id
+                        if ident.get("type") in ["ip", "ipv4", "ipv6"]:
+                            new_map[ident.get("value")] = dev_id
                 for k, v in LOCAL_DEVICE_MAP.items():
-                    if k not in new_map: new_map[k] = v
+                    if k not in new_map:
+                        new_map[k] = v
                 LOCAL_DEVICE_MAP = new_map
-        except: pass
+        except:
+            pass
         time.sleep(120)
 
 def get_or_create_mrbenny_id(ip):
     global LOCAL_DEVICE_MAP
-    if ip in LOCAL_DEVICE_MAP and LOCAL_DEVICE_MAP[ip] != "N/A": return LOCAL_DEVICE_MAP[ip]
-    payload = {"client_event_id": f"ov2-boot-{uuid.uuid4().hex[:8]}", "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "event_type": "bootstrap_identify", "observations": [{"observation_ref": f"obs-{ip.replace('.', '')}", "identifiers": [{"type": "ip", "value": ip}]}]}
+    if ip in LOCAL_DEVICE_MAP and LOCAL_DEVICE_MAP[ip] != "N/A":
+        return LOCAL_DEVICE_MAP[ip]
+    payload = {
+        "client_event_id": f"ov2-boot-{uuid.uuid4().hex[:8]}",
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "event_type": "bootstrap_identify",
+        "observations": [{
+            "observation_ref": f"obs-{ip.replace('.', '')}",
+            "identifiers": [{"type": "ip", "value": ip}]
+        }]
+    }
     try:
         res = mrbenny_request("/ingest/data", method="POST", payload=payload)
         if res and res.get("ok"):
@@ -208,7 +261,8 @@ def get_or_create_mrbenny_id(ip):
                 new_id = list(id_map.values())[0]
                 LOCAL_DEVICE_MAP[ip] = new_id
                 return new_id
-    except: pass
+    except:
+        pass
     LOCAL_DEVICE_MAP[ip] = "N/A"
     return "N/A"
 
@@ -217,14 +271,21 @@ def get_or_create_mrbenny_id(ip):
 # =====================================================================
 def _discord_send(payload_dict, retry_count=0):
     global DISCORD_LAST_SEND
-    if not DISCORD_WEBHOOK: return False
-    if retry_count >= 3: return False
+    if not DISCORD_WEBHOOK:
+        return False
+    if retry_count >= 3:
+        return False
     with DISCORD_LOCK:
         wait = DISCORD_MIN_INTERVAL - (time.time() - DISCORD_LAST_SEND)
-        if wait > 0: time.sleep(wait)
+        if wait > 0:
+            time.sleep(wait)
         DISCORD_LAST_SEND = time.time()
     try:
-        req = urllib.request.Request(DISCORD_WEBHOOK, json.dumps(payload_dict).encode('utf-8'), {'Content-Type': 'application/json', 'User-Agent': 'SOC-OV2-Agent/2.0'})
+        req = urllib.request.Request(
+            DISCORD_WEBHOOK,
+            json.dumps(payload_dict).encode('utf-8'),
+            {'Content-Type': 'application/json', 'User-Agent': 'SOC-OV2-Agent/2.0'}
+        )
         urllib.request.urlopen(req, timeout=8)
         return True
     except urllib.error.HTTPError as e:
@@ -232,11 +293,15 @@ def _discord_send(payload_dict, retry_count=0):
             time.sleep(2.0)
             return _discord_send(payload_dict, retry_count + 1)
         return False
-    except: return False
+    except:
+        return False
 
-def send_discord_alert(host, name, severity, cve, is_high, mrbenny_id, solution, is_kev_exploited, soar_action=None):
-    try: score = float(severity)
-    except: score = 0.0
+def send_discord_alert(host, name, severity, cve, is_high, mrbenny_id,
+                       solution, is_kev_exploited, soar_action=None):
+    try:
+        score = float(severity)
+    except:
+        score = 0.0
     color        = 0x000000 if is_kev_exploited else (0xFF0000 if score >= 7.0 else 0xFF8C00)
     host_display = f"`{host}`" + (f"\n🔖 MrBenny ID: `{mrbenny_id}`" if mrbenny_id != "N/A" else "")
     payload = {
@@ -245,10 +310,12 @@ def send_discord_alert(host, name, severity, cve, is_high, mrbenny_id, solution,
             "title": f"🔍 {name}",
             "color": color,
             "fields": [
-                {"name": "🖥️ Host",   "value": host_display,                                      "inline": True},
-                {"name": "⚠️ CVSS",   "value": f"**{severity}**",                                 "inline": True},
-                {"name": "🏷️ CVE",   "value": f"`{cve}`",                                        "inline": False},
-                {"name": "🛡️ SOAR" if soar_action else "🛠️ Soluție", "value": soar_action if soar_action else f"*{solution[:500]}*", "inline": False}
+                {"name": "🖥️ Host",  "value": host_display,        "inline": True},
+                {"name": "⚠️ CVSS",  "value": f"**{severity}**",   "inline": True},
+                {"name": "🏷️ CVE",  "value": f"`{cve}`",           "inline": False},
+                {"name": "🛡️ SOAR" if soar_action else "🛠️ Soluție",
+                 "value": soar_action if soar_action else f"*{solution[:500]}*",
+                 "inline": False}
             ],
             "footer": {"text": "SOC OV2 Agent | Trusted Mode B2 | Infisical"}
         }]
@@ -271,10 +338,12 @@ def send_discord_resolved(host, name, cve, mrbenny_id):
     _discord_send(payload)
 
 def send_startup_message():
-    sursa = "✅ Infisical API" if "DISCORD_WEBHOOK" in _SECRETS and os.environ.get("INFISICAL_CLIENT_ID") else "⚠️ Env vars"
+    sursa = ("✅ Infisical API"
+             if "DISCORD_WEBHOOK" in _SECRETS and os.environ.get("INFISICAL_CLIENT_ID")
+             else "⚠️ Env vars")
     soar_status = "✅ ACTIV" if SOAR_LOADED else "❌ EROARE"
     _discord_send({"content": (
-        "🟢 **SOC OV2 — SISTEM PORNIT (vFINAL - Port Quarantine Fix)**\n"
+        "🟢 **SOC OV2 — SISTEM PORNIT (vFINAL - HIDS Fix)**\n"
         f"Secrete: **{sursa}** ({len(_SECRETS)} incarcate)\n"
         f"Status SOAR: **{soar_status}**"
     )})
@@ -289,7 +358,8 @@ def fetch_cisa_kev():
         with urllib.request.urlopen(req, timeout=15) as response:
             data = json.loads(response.read().decode())
             CISA_KEV_LIST = {vuln["cveID"] for vuln in data.get("vulnerabilities", [])}
-    except: pass
+    except:
+        pass
 
 def get_openvas_data():
     global IS_FIRST_RUN
@@ -297,7 +367,9 @@ def get_openvas_data():
     try:
         with Gmp(connection, transform=EtreeTransform()) as gmp:
             gmp.authenticate(GVMD_USER, GVMD_PASS)
-            results = gmp.get_results(filter_string="rows=-1 ignore_pagination=1 trash=0 apply_overrides=1")
+            results = gmp.get_results(
+                filter_string="rows=-1 ignore_pagination=1 trash=0 apply_overrides=1"
+            )
 
             unique_high, unique_med, unique_low, unique_kev = set(), set(), set(), set()
             current_signatures = set()
@@ -306,7 +378,8 @@ def get_openvas_data():
                 try:
                     host_elem = res.find('host')
                     host      = host_elem.text if host_elem is not None else "unknown"
-                    if not host or host == "unknown": continue
+                    if not host or host == "unknown":
+                        continue
 
                     nvt_node = res.find('nvt')
                     oid      = nvt_node.get('oid')
@@ -319,11 +392,14 @@ def get_openvas_data():
 
                     if sev >= 4.0:
                         current_signatures.add(sig)
-                        if sev >= 7.0: unique_high.add(sig)
-                        else: unique_med.add(sig)
+                        if sev >= 7.0:
+                            unique_high.add(sig)
+                        else:
+                            unique_med.add(sig)
 
                         is_kev = (cve in CISA_KEV_LIST and cve != "N/A")
-                        if is_kev: unique_kev.add(sig)
+                        if is_kev:
+                            unique_kev.add(sig)
 
                         if sig not in ALREADY_ALERTED:
                             mb_id = get_or_create_mrbenny_id(host)
@@ -340,11 +416,15 @@ def get_openvas_data():
                                     except Exception as e:
                                         log_err("[SOAR]", e)
 
-                                send_discord_alert(host, name, str(sev), cve, (sev >= 7.0), mb_id, sol, is_kev, soar_action)
+                                send_discord_alert(
+                                    host, name, str(sev), cve,
+                                    (sev >= 7.0), mb_id, sol, is_kev, soar_action
+                                )
                                 DEVICE_RISK.labels(ip=host).set(1)
                     elif sev > 0:
                         unique_low.add(sig)
-                except: continue
+                except:
+                    continue
 
             resolved = set(ALREADY_ALERTED.keys()) - current_signatures
             for s in resolved:
@@ -359,51 +439,106 @@ def get_openvas_data():
             VULN_LOW.set(len(unique_low))
             VULN_KEV.set(len(unique_kev))
 
-    except Exception as e: pass
+    except Exception as e:
+        pass
 
 # =====================================================================
-# MODUL: HIDS & SOAR (Blocaj DOAR pe portul 22 - Salveaza reteaua WSL)
+# MODUL: HIDS & SOAR — FIX COMPLET
+# Race condition rezolvat cu QUARANTINE_LOCK
+# iptables -I INPUT 1 (insert la pozitia 1, nu append)
+# Reset corect dupa deblocare
+# Sudo fara parola interactiva (necesita: NOPASSWD: /sbin/iptables in sudoers)
 # =====================================================================
-atacatori_cunoscuti = {}
 
 def execute_quarantine(ip):
+    """
+    Blocheaza IP-ul pe portul 22 timp de 60 secunde, apoi il deblocheaza garantat.
+    Foloseste iptables -I (insert) la pozitia 1 pentru prioritate maxima.
+    """
+    # --- BLOCARE ---
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(hostname=HOST_UBUNTU_IP, port=22, username=HOST_UBUNTU_USER, password=HOST_UBUNTU_PASS, timeout=5)
-        
-        # CRITIC FIX: Blocăm DOAR portul 22 (SSH) ca să nu picăm router-ul intern al WSL!
-        stdin, stdout, stderr = client.exec_command(f"echo '{HOST_UBUNTU_PASS}' | sudo -S iptables -A INPUT -p tcp --dport 22 -s {ip} -j DROP")
-        stdout.channel.recv_exit_status()
-        
+        client.connect(
+            hostname=HOST_UBUNTU_IP,
+            port=22,
+            username=HOST_UBUNTU_USER,
+            password=HOST_UBUNTU_PASS,
+            timeout=5
+        )
+        # -I INPUT 1 = insert la pozitia 1 (prioritate maxima, nu append la final)
+        cmd_block = (
+            f"echo '{HOST_UBUNTU_PASS}' | sudo -S iptables -I INPUT 1 "
+            f"-p tcp --dport 22 -s {ip} -j DROP"
+        )
+        stdin, stdout, stderr = client.exec_command(cmd_block)
+        exit_code = stdout.channel.recv_exit_status()
         client.close()
-        log_msg(f"[SOAR] 🧱 Accesul SSH pt IP {ip} blocat in firewall.")
-    except Exception as e: log_err(f"[SOAR] Blocare {ip}", e)
 
+        if exit_code == 0:
+            log_msg(f"[SOAR] 🧱 IP {ip} BLOCAT pe portul SSH. Deblocare in 60s.")
+        else:
+            err = stderr.read().decode().strip()
+            log_msg(f"[SOAR] ⚠️ Blocare {ip} — exit code {exit_code}: {err}")
+
+    except Exception as e:
+        log_err(f"[SOAR] Blocare SSH {ip}", e)
+        # Chiar daca blocarea a esuat, asteptam si resetam starea
+        time.sleep(60)
+        with QUARANTINE_LOCK:
+            atacatori_cunoscuti[ip] = 0
+        return
+
+    # --- ASTEPTARE 60 secunde ---
     time.sleep(60)
 
+    # --- DEBLOCARE GARANTATA ---
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(hostname=HOST_UBUNTU_IP, port=22, username=HOST_UBUNTU_USER, password=HOST_UBUNTU_PASS, timeout=5)
-        
-        # Unblock garantat cu while loop DOAR pentru portul 22
-        unblock_cmd = f"echo '{HOST_UBUNTU_PASS}' | sudo -S sh -c 'while iptables -D INPUT -p tcp --dport 22 -s {ip} -j DROP 2>/dev/null; do true; done'"
-        
+        client.connect(
+            hostname=HOST_UBUNTU_IP,
+            port=22,
+            username=HOST_UBUNTU_USER,
+            password=HOST_UBUNTU_PASS,
+            timeout=5
+        )
+        # While loop: sterge TOATE regulile DROP pentru acel IP (in caz ca s-au adaugat duplicate)
+        unblock_cmd = (
+            f"echo '{HOST_UBUNTU_PASS}' | sudo -S sh -c "
+            f"'while iptables -D INPUT -p tcp --dport 22 -s {ip} -j DROP "
+            f"2>/dev/null; do true; done'"
+        )
         stdin, stdout, stderr = client.exec_command(unblock_cmd)
         stdout.channel.recv_exit_status()
-        
         client.close()
-        log_msg(f"[SOAR] 🟢 Accesul SSH pt IP {ip} deblocat GARANTAT.")
-    except Exception as e: log_err(f"[SOAR] Deblocare {ip}", e)
-    atacatori_cunoscuti[ip] = 0
+        log_msg(f"[SOAR] 🟢 IP {ip} DEBLOCAT GARANTAT dupa 60s.")
+
+    except Exception as e:
+        log_err(f"[SOAR] Deblocare SSH {ip}", e)
+    finally:
+        # IMPORTANT: Reset complet — IP-ul poate fi blocat din nou daca ataca
+        with QUARANTINE_LOCK:
+            atacatori_cunoscuti[ip] = 0
+        log_msg(f"[SOAR] 🔄 Stare resetata pentru {ip}. Monitorizare reluata.")
+
 
 def monitor_hids_logs():
+    """
+    Monitorizeaza /host_logs/auth.log pentru tentative SSH brute-force.
+    Dupa 3 incercari esuate de la acelasi IP, il blocheaza 60 secunde.
+    FIX: Lock anti race-condition, threshold >= 3 (nu == 3).
+    """
     log_file = "/host_logs/auth.log"
-    while not os.path.exists(log_file): time.sleep(5)
+
+    # Asteapta pana fisierul exista
+    while not os.path.exists(log_file):
+        time.sleep(5)
+
+    log_msg(f"[HIDS] ✅ Monitorizare activa pe {log_file}")
 
     f = open(log_file, "r", errors="replace")
-    f.seek(0, os.SEEK_END)
+    f.seek(0, os.SEEK_END)  # Citim doar liniile NOI, nu istoricul
 
     fail_patterns = [
         re.compile(r'Failed password for .* from (\d+\.\d+\.\d+\.\d+)'),
@@ -412,8 +547,9 @@ def monitor_hids_logs():
         re.compile(r'error: maximum authentication attempts exceeded for .* from (\d+\.\d+\.\d+\.\d+)')
     ]
 
+    # IPs care nu trebuie blocate niciodata
     WHITELIST_EXACTE  = {"192.168.128.181", "127.0.0.1", "::1"}
-    WHITELIST_PREFIXE = ["172.17.", "172.18.", "172.19."]
+    WHITELIST_PREFIXE = ["172.17.", "172.18.", "172.19.", "10.0."]
 
     while True:
         line = f.readline()
@@ -421,6 +557,7 @@ def monitor_hids_logs():
             time.sleep(0.5)
             continue
 
+        # Detectam IP-ul din linie
         ip = None
         for pattern in fail_patterns:
             match = pattern.search(line)
@@ -428,38 +565,66 @@ def monitor_hids_logs():
                 ip = match.group(1)
                 break
 
+        # Fallback pentru "message repeated X times"
         if not ip and "message repeated" in line:
             m_ip = re.search(r'from (\d+\.\d+\.\d+\.\d+)', line)
-            if m_ip: ip = m_ip.group(1)
+            if m_ip:
+                ip = m_ip.group(1)
 
-        if not ip: continue
-        if (ip in WHITELIST_EXACTE or any(ip.startswith(p) for p in WHITELIST_PREFIXE)): continue
-        if atacatori_cunoscuti.get(ip) == "BLOCKED": continue
+        if not ip:
+            continue
 
-        inc = 1
-        if "repeated" in line:
-            rm = re.search(r'repeated (\d+) times', line)
-            if rm: inc = int(rm.group(1))
+        # Skip whitelist
+        if ip in WHITELIST_EXACTE or any(ip.startswith(p) for p in WHITELIST_PREFIXE):
+            continue
 
-        current_count = atacatori_cunoscuti.get(ip, 0)
+        # FIX: Verifica starea in lock pentru a evita race condition
+        with QUARANTINE_LOCK:
+            stare_curenta = atacatori_cunoscuti.get(ip, 0)
 
-        for step in range(inc):
-            current_count += 1
-            if current_count <= 3:
-                log_msg(f"[HIDS] Detectie Brute-Force: {ip} ({current_count}/3)")
-                if inc > 1 and current_count < 3:
-                    time.sleep(0.8)
+            # Daca deja este blocat, ignoram
+            if stare_curenta == "BLOCKED":
+                continue
 
-            if current_count == 3:
+            # Calculam incrementul (pentru "message repeated X times")
+            inc = 1
+            if "repeated" in line:
+                rm = re.search(r'repeated (\d+) times', line)
+                if rm:
+                    inc = int(rm.group(1))
+
+            nou_count = stare_curenta + inc
+            log_msg(f"[HIDS] ⚠️ Tentativa SSH de la {ip} ({nou_count}/3)")
+
+            # FIX: >= 3 in loc de == 3 (prinde si cazul cu repeated)
+            if nou_count >= 3:
+                # Marcam ca BLOCAT in lock inainte sa lansam thread-ul
                 atacatori_cunoscuti[ip] = "BLOCKED"
-                mb_id = get_or_create_mrbenny_id(ip)
-                msg   = f"🛡️ **SOAR HIDS:** Portul SSH pt IP `{ip}` blocat in firewall 60s."
-                send_discord_alert("Ubuntu Host", "SSH Brute Force (HIDS)", "10.0", "N/A", True, mb_id, "Carantina SSH (60s)", False, msg)
-                threading.Thread(target=execute_quarantine, args=(ip,), daemon=True).start()
-                break
 
-        if atacatori_cunoscuti.get(ip) != "BLOCKED":
-            atacatori_cunoscuti[ip] = current_count
+                mb_id = get_or_create_mrbenny_id(ip)
+                msg   = (
+                    f"🛡️ **SOAR HIDS:** IP `{ip}` blocat SSH 60s.\n"
+                    f"Tentative detectate: **{nou_count}**"
+                )
+                log_msg(f"[SOAR] 🚨 BLOCARE INITIATA pentru {ip} ({nou_count} fail-uri detectate)")
+
+                send_discord_alert(
+                    "Ubuntu Host", "SSH Brute Force (HIDS)",
+                    "10.0", "N/A", True, mb_id,
+                    "Carantina SSH (60s)", False, msg
+                )
+
+                # Lansam thread-ul de carantina (execute_quarantine face reset dupa 60s)
+                threading.Thread(
+                    target=execute_quarantine,
+                    args=(ip,),
+                    daemon=True
+                ).start()
+
+            else:
+                # Actualizam contorul
+                atacatori_cunoscuti[ip] = nou_count
+
 
 # =====================================================================
 # MAIN
@@ -468,17 +633,20 @@ if __name__ == '__main__':
     authenticate_mrbenny()
     threading.Thread(target=mrbenny_heartbeat_loop, daemon=True).start()
     threading.Thread(target=mrbenny_ontology_loop,  daemon=True).start()
-    threading.Thread(target=monitor_hids_logs,       daemon=True).start()
+    threading.Thread(target=monitor_hids_logs,      daemon=True).start()
 
     fetch_cisa_kev()
     send_startup_message()
 
-    try: start_http_server(8000)
-    except Exception as e: log_err("[PROMETHEUS]", e)
+    try:
+        start_http_server(8000)
+    except Exception as e:
+        log_err("[PROMETHEUS]", e)
 
     loop = 0
     while True:
         get_openvas_data()
-        if loop % 720 == 0 and loop > 0: fetch_cisa_kev()
+        if loop % 720 == 0 and loop > 0:
+            fetch_cisa_kev()
         loop += 1
         time.sleep(5)
