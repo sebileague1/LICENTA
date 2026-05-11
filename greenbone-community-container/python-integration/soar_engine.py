@@ -2,18 +2,15 @@ import paramiko
 import time
 
 # =====================================================================
-# CONFIGURARE RETEA — PC NOU
+# CONFIGURARE RETEA
 # =====================================================================
 VALID_TRIGGER_IPS = [
-    "172.17.0.1",       # Gateway bridge docker0
-    "172.19.0.1",       # Gateway bridge retea Greenbone
-    "172.19.0.100",     # Metasploitable2 IP static
-    "192.168.128.181",  # Ubuntu host fizic PC nou
+    "172.17.0.1", "172.17.0.2", "172.19.0.1", 
+    "192.168.128.181", "172.19.0.100"
 ]
 
-# === Conectare DIRECTA la Metasploitable2 (prin reteaua interna Docker) ===
-SSH_HOST    = "172.19.0.100"  # IP-ul intern al containerului Metasploitable2
-SSH_PORT    = 22              # Portul standard SSH din container (nu cel mapat la host)
+SSH_HOST    = "172.19.0.100"
+SSH_PORT    = 22
 TARGET_USER = "msfadmin"
 TARGET_PASS = "msfadmin"
 
@@ -23,78 +20,52 @@ TARGET_PASS = "msfadmin"
 def log_soar(msg):
     print(msg, flush=True)
 
-def get_ssh_client():
-    """
-    Returneaza un client SSH configurat pentru Metasploitable2.
-    FIX: Metasploitable2 foloseste algoritmi SSH legacy (RSA/DSA vechi)
-    care nu sunt acceptati implicit de Paramiko modern.
-    Solutia: disabled_algorithms dezactiveaza doar variantele noi rsa-sha2-*
-    fortand Paramiko sa foloseasca ssh-rsa clasic compatibil cu OpenSSH 4.x.
-    """
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        hostname=SSH_HOST,
-        port=SSH_PORT,
-        username=TARGET_USER,
-        password=TARGET_PASS,
-        timeout=10,
-        look_for_keys=False,
-        allow_agent=False,
-        disabled_algorithms={
-            'pubkeys': ['rsa-sha2-256', 'rsa-sha2-512']
-        }
-    )
-    return client
-
 def verify_ftp_stopped(client):
-    """Verifica daca portul 21 mai este deschis ascultand conexiuni."""
     stdin, stdout, stderr = client.exec_command("netstat -tuln | grep ':21 '")
-    output = stdout.read().decode('utf-8')
-    return output.strip() == ""
+    return stdout.read().decode('utf-8').strip() == ""
 
 def execute_ftp_mitigation(target_ip):
     log_soar(f"[SOAR] 🛡️ INITIERE PROTOCOL: Oprire Port 21 pe {target_ip}")
-
     try:
-        client = get_ssh_client()
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        
+        # Conexiune perfect compatibila datorita paramiko==2.11.0
+        client.connect(
+            hostname=SSH_HOST, port=SSH_PORT,
+            username=TARGET_USER, password=TARGET_PASS,
+            timeout=10, look_for_keys=False, allow_agent=False
+        )
 
         if verify_ftp_stopped(client):
-            log_soar(f"[SOAR] ℹ️ Portul 21 este deja blocat pe {target_ip}.")
+            log_soar(f"[SOAR] ℹ️ Portul 21 este deja inactiv.")
             client.close()
             return "✅ **STATUT:** Portul 21 (FTP) este deja inactiv pe Metasploitable2."
 
         log_soar("[SOAR] ⚙️ Lansare comenzi AGRESIVE de mitigare pe Metasploitable2...")
+        
+        # Comanda combinata pentru a forta oprirea oricarui serviciu FTP
+        kill_cmd = f"echo '{TARGET_PASS}' | sudo -S sh -c 'fuser -k -9 21/tcp; killall -9 vsftpd proftpd inetd xinetd; /etc/init.d/vsftpd stop'"
+        
+        try:
+            stdin, stdout, stderr = client.exec_command(kill_cmd)
+            stdout.channel.recv_exit_status() 
+        except Exception as cmd_err:
+            log_soar(f"[SOAR] ⚠️ Comanda esuata (continuam): {cmd_err}")
 
-        mitigation_commands = [
-            f"echo '{TARGET_PASS}' | sudo -S service vsftpd stop",
-            f"echo '{TARGET_PASS}' | sudo -S service proftpd stop",
-            f"echo '{TARGET_PASS}' | sudo -S killall -9 vsftpd proftpd inetd xinetd",
-            f"echo '{TARGET_PASS}' | sudo -S fuser -k -9 21/tcp",
-            f"echo '{TARGET_PASS}' | sudo -S lsof -t -i:21 | xargs -r sudo kill -9"
-        ]
-
-        for cmd in mitigation_commands:
-            try:
-                client.exec_command(cmd)
-                time.sleep(0.5)
-            except Exception as cmd_err:
-                log_soar(f"[SOAR] ⚠️ Comanda esuata (continuam): {cmd_err}")
-
-        time.sleep(3)
+        time.sleep(4) 
 
         if verify_ftp_stopped(client):
             log_soar(f"[SOAR] ✅ CONFIRMAT: Portul 21 eliberat pe {target_ip}.")
             client.close()
             return (
                 "🛡️ **SOAR MITIGARE REUSITA:**\n"
-                f"Procesele de pe portul 21 (FTP) au fost oprite pe `{target_ip}` "
-                "pentru a bloca atacul Brute Force."
+                f"Procesele FTP au fost oprite pe `{target_ip}` pentru a bloca atacul."
             )
         else:
             client.close()
             log_soar(f"[SOAR] ❌ Portul 21 refuza sa se inchida pe {target_ip}.")
-            return "❌ **SOAR EROARE:** Portul 21 refuza sa se inchida. Interventie manuala necesara."
+            return "❌ **SOAR EROARE:** Portul 21 refuza sa se inchida."
 
     except Exception as e:
         msg = f"⚠️ **SOAR ESEC TEHNIC:** {type(e).__name__}: {str(e)}"
@@ -106,19 +77,15 @@ def trigger_remediation(ip_sursa_alerta, vuln_name):
     log_soar(f"[SOAR] 🔍 Evaluare: ip={ip_sursa_alerta} | vuln={vuln_name[:60]}")
 
     if ip_sursa_alerta not in VALID_TRIGGER_IPS:
-        log_soar(f"[SOAR] ⏭️ IP {ip_sursa_alerta} nu e in VALID_TRIGGER_IPS. Ignorat.")
+        log_soar(f"[SOAR] ⏭️ IP {ip_sursa_alerta} ignorat (nu e in lista VALID_TRIGGER_IPS).")
         return None
 
-    if "ftp brute force logins with default credentials reporting" in vuln_lower:
+    if "ftp" in vuln_lower and ("brute force" in vuln_lower or "default credentials" in vuln_lower):
         log_soar(f"[SOAR] 🎯 TINTA CONFIRMATA: FTP Brute Force pe {ip_sursa_alerta}!")
         return execute_ftp_mitigation(ip_sursa_alerta)
-
     elif "ftp" in vuln_lower:
-        log_soar("[SOAR] ℹ️ Alerta FTP minora ignorata.")
         return None
-
     elif "ssh" in vuln_lower:
-        log_soar("[SOAR] 🔒 Politica SSH: automatizarea dezactivata (Anti-Lockout).")
-        return "🛡️ **POLITICA SOAR:** Automatizarea pe portul 22 dezactivata (Anti-Lockout)."
-
+        return "🛡️ **POLITICA SOAR:** Automatizarea pe portul 22 dezactivata."
+    
     return None
