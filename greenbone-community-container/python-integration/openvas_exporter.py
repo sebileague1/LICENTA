@@ -30,10 +30,16 @@ def silent_handle_error(self, request, client_address):
 socketserver.BaseServer.handle_error = silent_handle_error
 
 # =====================================================================
-# LOGGING
+# LOGGING ATOMIC (Previne incalecarea pe acelasi rand)
 # =====================================================================
+PRINT_LOCK = threading.Lock()
+
 def log_msg(mesaj):
-    print(mesaj, flush=True)
+    # Fortam printarea fara ruperi de linie parazite, totul intr-o singura operatiune protejata de Lock
+    mesaj_curat = str(mesaj).replace('\n', ' ').replace('\r', '')
+    with PRINT_LOCK:
+        sys.stdout.write(mesaj_curat + '\n')
+        sys.stdout.flush()
 
 def log_err(context, exc):
     tip = type(exc).__name__
