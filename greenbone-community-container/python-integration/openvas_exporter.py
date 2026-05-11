@@ -1,3 +1,6 @@
+import warnings
+warnings.filterwarnings("ignore")
+
 import time
 import json
 import urllib.request
@@ -487,7 +490,8 @@ def get_openvas_data():
             VULN_LOW.set(len(unique_low))
             VULN_KEV.set(len(unique_kev))
 
-            log_msg(f"[OV] 📊 H:{len(unique_high)} M:{len(unique_med)} L:{len(unique_low)} KEV:{len(unique_kev)} | Alerte noi: {len(new_alerts)}")
+            # Aici am oprit logarea "zgomotoasa" cu #
+            # log_msg(f"[OV] 📊 H:{len(unique_high)} M:{len(unique_med)} L:{len(unique_low)} KEV:{len(unique_kev)} | Alerte noi: {len(new_alerts)}")
 
     except Exception as e:
         log_err("[OpenVAS]", e)
