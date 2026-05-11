@@ -6,15 +6,14 @@ import time
 # =====================================================================
 VALID_TRIGGER_IPS = [
     "172.17.0.1",       # Gateway bridge docker0
-    "172.17.0.2",       # Metasploitable2 direct
-    "172.19.0.1",       # Gateway bridge retea Greenbone (NOU)
+    "172.19.0.1",       # Gateway bridge retea Greenbone
+    "172.19.0.100",     # Metasploitable2 IP static
     "192.168.128.181",  # Ubuntu host fizic PC nou
-    "172.19.0.100",     # metasploidable2 ip static
 ]
 
 # === Conectare DIRECTA la Metasploitable2 (prin reteaua interna Docker) ===
-SSH_HOST    = "172.19.0.100" # Folosim IP-ul intern de container
-SSH_PORT    = 22             # Folosim portul standard SSH din container
+SSH_HOST    = "172.19.0.100"  # IP-ul intern al containerului Metasploitable2
+SSH_PORT    = 22              # Portul standard SSH din container (nu cel mapat la host)
 TARGET_USER = "msfadmin"
 TARGET_PASS = "msfadmin"
 
@@ -23,6 +22,30 @@ TARGET_PASS = "msfadmin"
 # =====================================================================
 def log_soar(msg):
     print(msg, flush=True)
+
+def get_ssh_client():
+    """
+    Returneaza un client SSH configurat pentru Metasploitable2.
+    FIX: Metasploitable2 foloseste algoritmi SSH legacy (RSA/DSA vechi)
+    care nu sunt acceptati implicit de Paramiko modern.
+    Solutia: disabled_algorithms dezactiveaza doar variantele noi rsa-sha2-*
+    fortand Paramiko sa foloseasca ssh-rsa clasic compatibil cu OpenSSH 4.x.
+    """
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(
+        hostname=SSH_HOST,
+        port=SSH_PORT,
+        username=TARGET_USER,
+        password=TARGET_PASS,
+        timeout=10,
+        look_for_keys=False,
+        allow_agent=False,
+        disabled_algorithms={
+            'pubkeys': ['rsa-sha2-256', 'rsa-sha2-512']
+        }
+    )
+    return client
 
 def verify_ftp_stopped(client):
     """Verifica daca portul 21 mai este deschis ascultand conexiuni."""
@@ -34,16 +57,7 @@ def execute_ftp_mitigation(target_ip):
     log_soar(f"[SOAR] 🛡️ INITIERE PROTOCOL: Oprire Port 21 pe {target_ip}")
 
     try:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(
-            hostname=SSH_HOST,
-            port=SSH_PORT,
-            username=TARGET_USER,
-            password=TARGET_PASS,
-            timeout=10,
-            disabled_algorithms={'pubkeys': []}
-        )
+        client = get_ssh_client()
 
         if verify_ftp_stopped(client):
             log_soar(f"[SOAR] ℹ️ Portul 21 este deja blocat pe {target_ip}.")
@@ -57,7 +71,7 @@ def execute_ftp_mitigation(target_ip):
             f"echo '{TARGET_PASS}' | sudo -S service proftpd stop",
             f"echo '{TARGET_PASS}' | sudo -S killall -9 vsftpd proftpd inetd xinetd",
             f"echo '{TARGET_PASS}' | sudo -S fuser -k -9 21/tcp",
-            f"echo '{TARGET_PASS}' | sudo -S lsof -t -i:21 | xargs -r sudo kill -9" # GLONTUL DE ARGINT
+            f"echo '{TARGET_PASS}' | sudo -S lsof -t -i:21 | xargs -r sudo kill -9"
         ]
 
         for cmd in mitigation_commands:
@@ -67,7 +81,7 @@ def execute_ftp_mitigation(target_ip):
             except Exception as cmd_err:
                 log_soar(f"[SOAR] ⚠️ Comanda esuata (continuam): {cmd_err}")
 
-        time.sleep(3) # Asteptam nitel sa se elibereze portul
+        time.sleep(3)
 
         if verify_ftp_stopped(client):
             log_soar(f"[SOAR] ✅ CONFIRMAT: Portul 21 eliberat pe {target_ip}.")
