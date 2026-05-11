@@ -30,16 +30,20 @@ def silent_handle_error(self, request, client_address):
 socketserver.BaseServer.handle_error = silent_handle_error
 
 # =====================================================================
-# LOGGING ATOMIC (Previne incalecarea pe acelasi rand)
+# LOGGING ATOMIC CURATAT (Previne spatiile goale si incalecarea)
 # =====================================================================
 PRINT_LOCK = threading.Lock()
 
 def log_msg(mesaj):
-    # Fortam printarea fara ruperi de linie parazite, totul intr-o singura operatiune protejata de Lock
-    mesaj_curat = str(mesaj).replace('\n', ' ').replace('\r', '')
-    with PRINT_LOCK:
-        sys.stdout.write(mesaj_curat + '\n')
-        sys.stdout.flush()
+    # Daca mesajul este None sau gol, nu facem nimic pentru a nu pune randuri goale
+    if not mesaj:
+        return
+    # Scoatem orice \n si spatiu inutil de la inceput sau sfarsit
+    mesaj_curat = str(mesaj).strip().replace('\n', ' ').replace('\r', '')
+    if mesaj_curat:
+        with PRINT_LOCK:
+            sys.stdout.write(mesaj_curat + '\n')
+            sys.stdout.flush()
 
 def log_err(context, exc):
     tip = type(exc).__name__
@@ -229,7 +233,12 @@ def send_discord_alert(host, name, severity, cve, is_high, mrbenny_id,
     except:
         score = 0.0
     color        = 0x000000 if is_kev_exploited else (0xFF0000 if score >= 7.0 else 0xFF8C00)
-    host_display = f"`{host}`" + (f"\n🔖 MrBenny ID: `{mrbenny_id}`" if mrbenny_id != "N/A" else "")
+    host_display = f"`{host}`" + (f" | 🔖 MrBenny ID: `{mrbenny_id}`" if mrbenny_id != "N/A" else "")
+    
+    # Asiguram un SOAR ACTION si SOLUTION curat, fara newlines suplimentare nedorite in embed
+    sol = solution.replace('\n', ' ') if solution else "N/A"
+    act = soar_action.replace('\n', ' ') if soar_action else f"*{sol[:500]}*"
+
     payload = {
         "content": "🚨 **VULNERABILITATE NOUĂ DETECTATĂ**" if not is_kev_exploited else "☠️ **CRITICAL KEV MATCH!**",
         "embeds": [{
@@ -240,7 +249,7 @@ def send_discord_alert(host, name, severity, cve, is_high, mrbenny_id,
                 {"name": "⚠️ CVSS",  "value": f"**{severity}**",   "inline": True},
                 {"name": "🏷️ CVE",  "value": f"`{cve}`",           "inline": False},
                 {"name": "🛡️ SOAR" if soar_action else "🛠️ Soluție",
-                 "value": soar_action if soar_action else f"*{solution[:500]}*",
+                 "value": act,
                  "inline": False}
             ],
             "footer": {"text": "SOC OV2 Agent | Trusted Mode B2 | Infisical"}
@@ -509,9 +518,6 @@ def get_openvas_data():
             VULN_LOW.set(len(unique_low))
             VULN_KEV.set(len(unique_kev))
 
-            # Aici am oprit logarea "zgomotoasa" cu #
-            # log_msg(f"[OV] 📊 H:{len(unique_high)} M:{len(unique_med)} L:{len(unique_low)} KEV:{len(unique_kev)} | Alerte noi: {len(new_alerts)}")
-
     except Exception as e:
         log_err("[OpenVAS]", e)
 
@@ -630,10 +636,8 @@ def monitor_hids_logs():
             if nou_count >= 3:
                 atacatori_cunoscuti[ip] = "BLOCKED"
                 mb_id = get_or_create_mrbenny_id(ip)
-                msg = (
-                    f"🛡️ **SOAR HIDS:** IP `{ip}` blocat SSH 60s.\n"
-                    f"Tentative detectate: **{nou_count}**"
-                )
+                msg = f"🛡️ **SOAR HIDS:** IP `{ip}` blocat SSH 60s. (Tentative: **{nou_count}**)"
+                
                 log_msg(f"[SOAR] 🚨 BLOCARE INITIATA pentru {ip} ({nou_count} fail-uri)")
                 send_discord_alert(
                     "Ubuntu Host", "SSH Brute Force (HIDS)",
