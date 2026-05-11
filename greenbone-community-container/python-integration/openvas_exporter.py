@@ -6,6 +6,7 @@ import uuid
 import threading
 import re
 import os
+import queue
 import paramiko
 from gvm.connections import UnixSocketConnection
 from gvm.protocols.gmp import Gmp
@@ -64,24 +65,24 @@ def load_secrets_from_infisical():
                     pass
 
             if len(infisical_secrets) == 0:
-                log_msg("[INFISICAL] ⚠️ Infisical a returnat 0 secrete in toate mediile. Fallback pe env vars.")
+                log_msg("[INFISICAL] ⚠️ Infisical a returnat 0 secrete. Fallback pe env vars.")
             else:
                 for s in infisical_secrets:
                     secrets[s["secretKey"]] = s["secretValue"]
-                log_msg(f"[INFISICAL] ✅ {len(secrets)} secrete incarcate cu succes din mediul '{found_env}'.")
+                log_msg(f"[INFISICAL] ✅ {len(secrets)} secrete incarcate din mediul '{found_env}'.")
                 return secrets
 
         except Exception as e:
             log_msg(f"[INFISICAL] ⚠️ Eroare conectare API: {e}. Fallback pe env vars.")
     else:
-        log_msg("[INFISICAL] ⚠️ Variabile lipsa in docker-compose. Folosesc env vars direct.")
+        log_msg("[INFISICAL] ⚠️ Variabile lipsa. Folosesc env vars direct.")
 
     for name in ["DISCORD_WEBHOOK", "HOST_UBUNTU_IP", "HOST_UBUNTU_USER", "HOST_UBUNTU_PASS",
                  "GVMD_USER", "GVMD_PASS", "MRBENNY_ADMIN_KEY", "MRBENNY_HARDWARE_UUID"]:
         val = os.environ.get(name)
         if val:
             secrets[name] = val
-    log_msg(f"[INFISICAL] ⚠️ Fallback activ: {len(secrets)} secrete locale incarcate.")
+    log_msg(f"[INFISICAL] ⚠️ Fallback activ: {len(secrets)} secrete locale.")
     return secrets
 
 _SECRETS = load_secrets_from_infisical()
@@ -108,9 +109,9 @@ SOAR_LOADED = False
 try:
     import soar_engine
     SOAR_LOADED = True
-    log_msg("[STARTUP] ✅ Modulul SOAR a fost incarcat cu succes in memorie!")
+    log_msg("[STARTUP] ✅ Modulul SOAR a fost incarcat cu succes!")
 except Exception as e:
-    log_msg(f"[STARTUP] ❌ ATENTIE: Modulul soar_engine nu a putut fi incarcat! Motiv: {e}")
+    log_msg(f"[STARTUP] ❌ soar_engine nu a putut fi incarcat! Motiv: {e}")
 
 # =====================================================================
 # CONFIGURARE
@@ -133,15 +134,123 @@ LOCAL_DEVICE_MAP = {}
 ALREADY_ALERTED  = {}
 IS_FIRST_RUN     = True
 AGENT_START_TIME = time.time()
-DISCORD_LAST_SEND    = 0
-DISCORD_LOCK         = threading.Lock()
-DISCORD_MIN_INTERVAL = 1.5
 
 # =====================================================================
-# FIX HIDS — Lock anti race-condition + state management
+# OPT 1: DISCORD QUEUE
+# Thread dedicat pentru trimiterea alertelor Discord.
+# Rezolva problema rate limiting si elibereaza loop-ul principal.
 # =====================================================================
-QUARANTINE_LOCK  = threading.Lock()
-atacatori_cunoscuti = {}   # ip -> int (count) | "BLOCKED"
+DISCORD_QUEUE        = queue.Queue(maxsize=100)
+DISCORD_MIN_INTERVAL = 2.0
+DISCORD_LOCK         = threading.Lock()
+DISCORD_LAST_SEND    = 0
+
+def _discord_send_raw(payload_dict, retry_count=0):
+    global DISCORD_LAST_SEND
+    if not DISCORD_WEBHOOK:
+        return False
+    if retry_count >= 3:
+        return False
+    with DISCORD_LOCK:
+        wait = DISCORD_MIN_INTERVAL - (time.time() - DISCORD_LAST_SEND)
+        if wait > 0:
+            time.sleep(wait)
+        DISCORD_LAST_SEND = time.time()
+    try:
+        req = urllib.request.Request(
+            DISCORD_WEBHOOK,
+            json.dumps(payload_dict).encode('utf-8'),
+            {'Content-Type': 'application/json', 'User-Agent': 'SOC-OV2-Agent/2.0'}
+        )
+        urllib.request.urlopen(req, timeout=8)
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            try:
+                body = json.loads(e.read().decode())
+                wait_time = float(body.get("retry_after", 2.0))
+            except:
+                wait_time = 2.0
+            log_msg(f"[DISCORD] ⏳ Rate limited. Astept {wait_time}s...")
+            time.sleep(wait_time)
+            return _discord_send_raw(payload_dict, retry_count + 1)
+        return False
+    except Exception as e:
+        log_err("[DISCORD]", e)
+        return False
+
+def discord_worker():
+    log_msg("[DISCORD] ✅ Worker Discord pornit.")
+    while True:
+        try:
+            payload = DISCORD_QUEUE.get(timeout=5)
+            _discord_send_raw(payload)
+            DISCORD_QUEUE.task_done()
+        except queue.Empty:
+            continue
+        except Exception as e:
+            log_err("[DISCORD Worker]", e)
+
+def _discord_send(payload_dict):
+    """Non-blocking — adauga in coada, nu blocheza loop-ul principal."""
+    if not DISCORD_WEBHOOK:
+        return
+    try:
+        DISCORD_QUEUE.put_nowait(payload_dict)
+    except queue.Full:
+        log_msg("[DISCORD] ⚠️ Coada plina, mesaj ignorat.")
+
+def send_discord_alert(host, name, severity, cve, is_high, mrbenny_id,
+                       solution, is_kev_exploited, soar_action=None):
+    try:
+        score = float(severity)
+    except:
+        score = 0.0
+    color        = 0x000000 if is_kev_exploited else (0xFF0000 if score >= 7.0 else 0xFF8C00)
+    host_display = f"`{host}`" + (f"\n🔖 MrBenny ID: `{mrbenny_id}`" if mrbenny_id != "N/A" else "")
+    payload = {
+        "content": "🚨 **VULNERABILITATE NOUĂ DETECTATĂ**" if not is_kev_exploited else "☠️ **CRITICAL KEV MATCH!**",
+        "embeds": [{
+            "title": f"🔍 {name}",
+            "color": color,
+            "fields": [
+                {"name": "🖥️ Host",  "value": host_display,        "inline": True},
+                {"name": "⚠️ CVSS",  "value": f"**{severity}**",   "inline": True},
+                {"name": "🏷️ CVE",  "value": f"`{cve}`",           "inline": False},
+                {"name": "🛡️ SOAR" if soar_action else "🛠️ Soluție",
+                 "value": soar_action if soar_action else f"*{solution[:500]}*",
+                 "inline": False}
+            ],
+            "footer": {"text": "SOC OV2 Agent | Trusted Mode B2 | Infisical"}
+        }]
+    }
+    _discord_send(payload)
+
+def send_discord_resolved(host, name, cve, mrbenny_id):
+    payload = {
+        "content": "✅ **VULNERABILITATE REMEDIATĂ / ÎNCHISĂ**",
+        "embeds": [{
+            "title": f"✅ {name}",
+            "color": 0x00C853,
+            "fields": [
+                {"name": "🖥️ Host",   "value": f"`{host}`",      "inline": True},
+                {"name": "📋 Status", "value": "Rezolvat/Șters", "inline": True}
+            ],
+            "footer": {"text": "SOC OV2 Agent | Incident Închis | Infisical"}
+        }]
+    }
+    _discord_send(payload)
+
+def send_startup_message():
+    sursa = ("✅ Infisical API"
+             if "DISCORD_WEBHOOK" in _SECRETS and os.environ.get("INFISICAL_CLIENT_ID")
+             else "⚠️ Env vars")
+    soar_status = "✅ ACTIV" if SOAR_LOADED else "❌ EROARE"
+    _discord_send({"content": (
+        "🟢 **SOC OV2 — SISTEM PORNIT (vFINAL - Optimizat)**\n"
+        f"Secrete: **{sursa}** ({len(_SECRETS)} incarcate)\n"
+        f"Status SOAR: **{soar_status}**"
+    )})
 
 # =====================================================================
 # MODUL: MR. BENNY INTEGRATION
@@ -211,7 +320,7 @@ def mrbenny_heartbeat_loop():
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "status": "online",
                 "metrics": {
-                    "queue_size": 0,
+                    "queue_size": DISCORD_QUEUE.qsize(),
                     "uptime_seconds": uptime,
                     "version": "2.0"
                 }
@@ -240,116 +349,44 @@ def mrbenny_ontology_loop():
             pass
         time.sleep(120)
 
+# OPT 2: MrBenny ID-urile se obtin ASYNC, nu blocheaza loop-ul principal
+MRBENNY_ID_QUEUE = queue.Queue()
+
 def get_or_create_mrbenny_id(ip):
-    global LOCAL_DEVICE_MAP
-    if ip in LOCAL_DEVICE_MAP and LOCAL_DEVICE_MAP[ip] != "N/A":
+    if ip in LOCAL_DEVICE_MAP:
         return LOCAL_DEVICE_MAP[ip]
-    payload = {
-        "client_event_id": f"ov2-boot-{uuid.uuid4().hex[:8]}",
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "event_type": "bootstrap_identify",
-        "observations": [{
-            "observation_ref": f"obs-{ip.replace('.', '')}",
-            "identifiers": [{"type": "ip", "value": ip}]
-        }]
-    }
-    try:
-        res = mrbenny_request("/ingest/data", method="POST", payload=payload)
-        if res and res.get("ok"):
-            id_map = res.get("data", {}).get("id_map", {})
-            if id_map:
-                new_id = list(id_map.values())[0]
-                LOCAL_DEVICE_MAP[ip] = new_id
-                return new_id
-    except:
-        pass
     LOCAL_DEVICE_MAP[ip] = "N/A"
+    MRBENNY_ID_QUEUE.put(ip)
     return "N/A"
 
-# =====================================================================
-# MODUL: DISCORD ALERTS
-# =====================================================================
-def _discord_send(payload_dict, retry_count=0):
-    global DISCORD_LAST_SEND
-    if not DISCORD_WEBHOOK:
-        return False
-    if retry_count >= 3:
-        return False
-    with DISCORD_LOCK:
-        wait = DISCORD_MIN_INTERVAL - (time.time() - DISCORD_LAST_SEND)
-        if wait > 0:
-            time.sleep(wait)
-        DISCORD_LAST_SEND = time.time()
-    try:
-        req = urllib.request.Request(
-            DISCORD_WEBHOOK,
-            json.dumps(payload_dict).encode('utf-8'),
-            {'Content-Type': 'application/json', 'User-Agent': 'SOC-OV2-Agent/2.0'}
-        )
-        urllib.request.urlopen(req, timeout=8)
-        return True
-    except urllib.error.HTTPError as e:
-        if e.code == 429:
-            time.sleep(2.0)
-            return _discord_send(payload_dict, retry_count + 1)
-        return False
-    except:
-        return False
-
-def send_discord_alert(host, name, severity, cve, is_high, mrbenny_id,
-                       solution, is_kev_exploited, soar_action=None):
-    try:
-        score = float(severity)
-    except:
-        score = 0.0
-    color        = 0x000000 if is_kev_exploited else (0xFF0000 if score >= 7.0 else 0xFF8C00)
-    host_display = f"`{host}`" + (f"\n🔖 MrBenny ID: `{mrbenny_id}`" if mrbenny_id != "N/A" else "")
-    payload = {
-        "content": "🚨 **VULNERABILITATE NOUĂ DETECTATĂ**" if not is_kev_exploited else "☠️ **CRITICAL KEV MATCH!**",
-        "embeds": [{
-            "title": f"🔍 {name}",
-            "color": color,
-            "fields": [
-                {"name": "🖥️ Host",  "value": host_display,        "inline": True},
-                {"name": "⚠️ CVSS",  "value": f"**{severity}**",   "inline": True},
-                {"name": "🏷️ CVE",  "value": f"`{cve}`",           "inline": False},
-                {"name": "🛡️ SOAR" if soar_action else "🛠️ Soluție",
-                 "value": soar_action if soar_action else f"*{solution[:500]}*",
-                 "inline": False}
-            ],
-            "footer": {"text": "SOC OV2 Agent | Trusted Mode B2 | Infisical"}
-        }]
-    }
-    _discord_send(payload)
-
-def send_discord_resolved(host, name, cve, mrbenny_id):
-    payload = {
-        "content": "✅ **VULNERABILITATE REMEDIATĂ / ÎNCHISĂ**",
-        "embeds": [{
-            "title": f"✅ {name}",
-            "color": 0x00C853,
-            "fields": [
-                {"name": "🖥️ Host",   "value": f"`{host}`",      "inline": True},
-                {"name": "📋 Status", "value": "Rezolvat/Șters", "inline": True}
-            ],
-            "footer": {"text": "SOC OV2 Agent | Incident Închis | Infisical"}
-        }]
-    }
-    _discord_send(payload)
-
-def send_startup_message():
-    sursa = ("✅ Infisical API"
-             if "DISCORD_WEBHOOK" in _SECRETS and os.environ.get("INFISICAL_CLIENT_ID")
-             else "⚠️ Env vars")
-    soar_status = "✅ ACTIV" if SOAR_LOADED else "❌ EROARE"
-    _discord_send({"content": (
-        "🟢 **SOC OV2 — SISTEM PORNIT (vFINAL - HIDS Fix)**\n"
-        f"Secrete: **{sursa}** ({len(_SECRETS)} incarcate)\n"
-        f"Status SOAR: **{soar_status}**"
-    )})
+def mrbenny_id_worker():
+    while True:
+        try:
+            ip = MRBENNY_ID_QUEUE.get(timeout=5)
+            payload = {
+                "client_event_id": f"ov2-boot-{uuid.uuid4().hex[:8]}",
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "event_type": "bootstrap_identify",
+                "observations": [{
+                    "observation_ref": f"obs-{ip.replace('.', '')}",
+                    "identifiers": [{"type": "ip", "value": ip}]
+                }]
+            }
+            res = mrbenny_request("/ingest/data", method="POST", payload=payload)
+            if res and res.get("ok"):
+                id_map = res.get("data", {}).get("id_map", {})
+                if id_map:
+                    LOCAL_DEVICE_MAP[ip] = list(id_map.values())[0]
+            MRBENNY_ID_QUEUE.task_done()
+        except queue.Empty:
+            continue
+        except Exception as e:
+            log_err("[MrBenny ID Worker]", e)
 
 # =====================================================================
 # MODUL: OPENVAS SYNC
+# OPT 3: Interval marit la 30s in loc de 5s
+# OPT 4: SOAR rulat in thread separat — nu blocheza loop-ul
 # =====================================================================
 def fetch_cisa_kev():
     global CISA_KEV_LIST
@@ -358,8 +395,21 @@ def fetch_cisa_kev():
         with urllib.request.urlopen(req, timeout=15) as response:
             data = json.loads(response.read().decode())
             CISA_KEV_LIST = {vuln["cveID"] for vuln in data.get("vulnerabilities", [])}
-    except:
-        pass
+        log_msg(f"[KEV] ✅ {len(CISA_KEV_LIST)} CVE-uri KEV incarcate.")
+    except Exception as e:
+        log_err("[KEV]", e)
+
+def run_soar_async(host, name, sev, cve, mb_id, sol, is_kev):
+    """OPT 4: SOAR si Discord ruleaza in thread separat, nu blocheaza."""
+    try:
+        soar_action = None
+        if SOAR_LOADED:
+            soar_action = soar_engine.trigger_remediation(host, name)
+        send_discord_alert(host, name, str(sev), cve, (sev >= 7.0),
+                           mb_id, sol, is_kev, soar_action)
+        DEVICE_RISK.labels(ip=host).set(1)
+    except Exception as e:
+        log_err(f"[SOAR Async {host}]", e)
 
 def get_openvas_data():
     global IS_FIRST_RUN
@@ -373,6 +423,7 @@ def get_openvas_data():
 
             unique_high, unique_med, unique_low, unique_kev = set(), set(), set(), set()
             current_signatures = set()
+            new_alerts = []
 
             for res in results.xpath('result'):
                 try:
@@ -407,24 +458,21 @@ def get_openvas_data():
                                 "host": host, "name": name,
                                 "cve": cve,   "mrbenny_id": mb_id
                             }
-
                             if not IS_FIRST_RUN:
-                                soar_action = None
-                                if SOAR_LOADED:
-                                    try:
-                                        soar_action = soar_engine.trigger_remediation(host, name)
-                                    except Exception as e:
-                                        log_err("[SOAR]", e)
+                                new_alerts.append((host, name, sev, cve, mb_id, sol, is_kev))
 
-                                send_discord_alert(
-                                    host, name, str(sev), cve,
-                                    (sev >= 7.0), mb_id, sol, is_kev, soar_action
-                                )
-                                DEVICE_RISK.labels(ip=host).set(1)
                     elif sev > 0:
                         unique_low.add(sig)
                 except:
                     continue
+
+            # OPT 4: Lansam SOAR async pentru fiecare alerta noua
+            for alert_data in new_alerts:
+                threading.Thread(
+                    target=run_soar_async,
+                    args=alert_data,
+                    daemon=True
+                ).start()
 
             resolved = set(ALREADY_ALERTED.keys()) - current_signatures
             for s in resolved:
@@ -439,34 +487,25 @@ def get_openvas_data():
             VULN_LOW.set(len(unique_low))
             VULN_KEV.set(len(unique_kev))
 
+            log_msg(f"[OV] 📊 H:{len(unique_high)} M:{len(unique_med)} L:{len(unique_low)} KEV:{len(unique_kev)} | Alerte noi: {len(new_alerts)}")
+
     except Exception as e:
-        pass
+        log_err("[OpenVAS]", e)
 
 # =====================================================================
-# MODUL: HIDS & SOAR — FIX COMPLET
-# Race condition rezolvat cu QUARANTINE_LOCK
-# iptables -I INPUT 1 (insert la pozitia 1, nu append)
-# Reset corect dupa deblocare
-# Sudo fara parola interactiva (necesita: NOPASSWD: /sbin/iptables in sudoers)
+# MODUL: HIDS & SOAR
 # =====================================================================
+QUARANTINE_LOCK     = threading.Lock()
+atacatori_cunoscuti = {}
 
 def execute_quarantine(ip):
-    """
-    Blocheaza IP-ul pe portul 22 timp de 60 secunde, apoi il deblocheaza garantat.
-    Foloseste iptables -I (insert) la pozitia 1 pentru prioritate maxima.
-    """
-    # --- BLOCARE ---
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(
-            hostname=HOST_UBUNTU_IP,
-            port=22,
-            username=HOST_UBUNTU_USER,
-            password=HOST_UBUNTU_PASS,
-            timeout=5
+            hostname=HOST_UBUNTU_IP, port=22,
+            username=HOST_UBUNTU_USER, password=HOST_UBUNTU_PASS, timeout=5
         )
-        # -I INPUT 1 = insert la pozitia 1 (prioritate maxima, nu append la final)
         cmd_block = (
             f"echo '{HOST_UBUNTU_PASS}' | sudo -S iptables -I INPUT 1 "
             f"-p tcp --dport 22 -s {ip} -j DROP"
@@ -474,71 +513,49 @@ def execute_quarantine(ip):
         stdin, stdout, stderr = client.exec_command(cmd_block)
         exit_code = stdout.channel.recv_exit_status()
         client.close()
-
         if exit_code == 0:
-            log_msg(f"[SOAR] 🧱 IP {ip} BLOCAT pe portul SSH. Deblocare in 60s.")
+            log_msg(f"[SOAR] 🧱 IP {ip} BLOCAT pe SSH. Deblocare in 60s.")
         else:
-            err = stderr.read().decode().strip()
-            log_msg(f"[SOAR] ⚠️ Blocare {ip} — exit code {exit_code}: {err}")
-
+            log_msg(f"[SOAR] ⚠️ Blocare {ip} exit code {exit_code}: {stderr.read().decode().strip()}")
     except Exception as e:
         log_err(f"[SOAR] Blocare SSH {ip}", e)
-        # Chiar daca blocarea a esuat, asteptam si resetam starea
         time.sleep(60)
         with QUARANTINE_LOCK:
             atacatori_cunoscuti[ip] = 0
         return
 
-    # --- ASTEPTARE 60 secunde ---
     time.sleep(60)
 
-    # --- DEBLOCARE GARANTATA ---
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(
-            hostname=HOST_UBUNTU_IP,
-            port=22,
-            username=HOST_UBUNTU_USER,
-            password=HOST_UBUNTU_PASS,
-            timeout=5
+            hostname=HOST_UBUNTU_IP, port=22,
+            username=HOST_UBUNTU_USER, password=HOST_UBUNTU_PASS, timeout=5
         )
-        # While loop: sterge TOATE regulile DROP pentru acel IP (in caz ca s-au adaugat duplicate)
         unblock_cmd = (
             f"echo '{HOST_UBUNTU_PASS}' | sudo -S sh -c "
-            f"'while iptables -D INPUT -p tcp --dport 22 -s {ip} -j DROP "
-            f"2>/dev/null; do true; done'"
+            f"'while iptables -D INPUT -p tcp --dport 22 -s {ip} -j DROP 2>/dev/null; do true; done'"
         )
         stdin, stdout, stderr = client.exec_command(unblock_cmd)
         stdout.channel.recv_exit_status()
         client.close()
         log_msg(f"[SOAR] 🟢 IP {ip} DEBLOCAT GARANTAT dupa 60s.")
-
     except Exception as e:
         log_err(f"[SOAR] Deblocare SSH {ip}", e)
     finally:
-        # IMPORTANT: Reset complet — IP-ul poate fi blocat din nou daca ataca
         with QUARANTINE_LOCK:
             atacatori_cunoscuti[ip] = 0
-        log_msg(f"[SOAR] 🔄 Stare resetata pentru {ip}. Monitorizare reluata.")
-
+        log_msg(f"[SOAR] 🔄 Stare resetata pentru {ip}.")
 
 def monitor_hids_logs():
-    """
-    Monitorizeaza /host_logs/auth.log pentru tentative SSH brute-force.
-    Dupa 3 incercari esuate de la acelasi IP, il blocheaza 60 secunde.
-    FIX: Lock anti race-condition, threshold >= 3 (nu == 3).
-    """
     log_file = "/host_logs/auth.log"
-
-    # Asteapta pana fisierul exista
     while not os.path.exists(log_file):
         time.sleep(5)
-
     log_msg(f"[HIDS] ✅ Monitorizare activa pe {log_file}")
 
     f = open(log_file, "r", errors="replace")
-    f.seek(0, os.SEEK_END)  # Citim doar liniile NOI, nu istoricul
+    f.seek(0, os.SEEK_END)
 
     fail_patterns = [
         re.compile(r'Failed password for .* from (\d+\.\d+\.\d+\.\d+)'),
@@ -547,7 +564,6 @@ def monitor_hids_logs():
         re.compile(r'error: maximum authentication attempts exceeded for .* from (\d+\.\d+\.\d+\.\d+)')
     ]
 
-    # IPs care nu trebuie blocate niciodata
     WHITELIST_EXACTE  = {"192.168.128.181", "127.0.0.1", "::1"}
     WHITELIST_PREFIXE = ["172.17.", "172.18.", "172.19.", "10.0."]
 
@@ -557,7 +573,6 @@ def monitor_hids_logs():
             time.sleep(0.5)
             continue
 
-        # Detectam IP-ul din linie
         ip = None
         for pattern in fail_patterns:
             match = pattern.search(line)
@@ -565,7 +580,6 @@ def monitor_hids_logs():
                 ip = match.group(1)
                 break
 
-        # Fallback pentru "message repeated X times"
         if not ip and "message repeated" in line:
             m_ip = re.search(r'from (\d+\.\d+\.\d+\.\d+)', line)
             if m_ip:
@@ -573,20 +587,14 @@ def monitor_hids_logs():
 
         if not ip:
             continue
-
-        # Skip whitelist
         if ip in WHITELIST_EXACTE or any(ip.startswith(p) for p in WHITELIST_PREFIXE):
             continue
 
-        # FIX: Verifica starea in lock pentru a evita race condition
         with QUARANTINE_LOCK:
             stare_curenta = atacatori_cunoscuti.get(ip, 0)
-
-            # Daca deja este blocat, ignoram
             if stare_curenta == "BLOCKED":
                 continue
 
-            # Calculam incrementul (pentru "message repeated X times")
             inc = 1
             if "repeated" in line:
                 rm = re.search(r'repeated (\d+) times', line)
@@ -596,44 +604,35 @@ def monitor_hids_logs():
             nou_count = stare_curenta + inc
             log_msg(f"[HIDS] ⚠️ Tentativa SSH de la {ip} ({nou_count}/3)")
 
-            # FIX: >= 3 in loc de == 3 (prinde si cazul cu repeated)
             if nou_count >= 3:
-                # Marcam ca BLOCAT in lock inainte sa lansam thread-ul
                 atacatori_cunoscuti[ip] = "BLOCKED"
-
                 mb_id = get_or_create_mrbenny_id(ip)
-                msg   = (
+                msg = (
                     f"🛡️ **SOAR HIDS:** IP `{ip}` blocat SSH 60s.\n"
                     f"Tentative detectate: **{nou_count}**"
                 )
-                log_msg(f"[SOAR] 🚨 BLOCARE INITIATA pentru {ip} ({nou_count} fail-uri detectate)")
-
+                log_msg(f"[SOAR] 🚨 BLOCARE INITIATA pentru {ip} ({nou_count} fail-uri)")
                 send_discord_alert(
                     "Ubuntu Host", "SSH Brute Force (HIDS)",
                     "10.0", "N/A", True, mb_id,
                     "Carantina SSH (60s)", False, msg
                 )
-
-                # Lansam thread-ul de carantina (execute_quarantine face reset dupa 60s)
-                threading.Thread(
-                    target=execute_quarantine,
-                    args=(ip,),
-                    daemon=True
-                ).start()
-
+                threading.Thread(target=execute_quarantine, args=(ip,), daemon=True).start()
             else:
-                # Actualizam contorul
                 atacatori_cunoscuti[ip] = nou_count
-
 
 # =====================================================================
 # MAIN
 # =====================================================================
 if __name__ == '__main__':
     authenticate_mrbenny()
+
+    # Pornim toate thread-urile de background
+    threading.Thread(target=discord_worker,         daemon=True).start()  # OPT 1
+    threading.Thread(target=mrbenny_id_worker,      daemon=True).start()  # OPT 2
     threading.Thread(target=mrbenny_heartbeat_loop, daemon=True).start()
     threading.Thread(target=mrbenny_ontology_loop,  daemon=True).start()
-    threading.Thread(target=monitor_hids_logs,      daemon=True).start()
+    threading.Thread(target=monitor_hids_logs,       daemon=True).start()
 
     fetch_cisa_kev()
     send_startup_message()
@@ -646,7 +645,10 @@ if __name__ == '__main__':
     loop = 0
     while True:
         get_openvas_data()
+
+        # KEV refresh la fiecare 6 ore (720 x 30s = 6h)
         if loop % 720 == 0 and loop > 0:
             fetch_cisa_kev()
+
         loop += 1
-        time.sleep(5)
+        time.sleep(30)  # OPT 3: 30s in loc de 5s
