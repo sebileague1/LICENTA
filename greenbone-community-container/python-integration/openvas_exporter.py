@@ -11,10 +11,23 @@ import re
 import os
 import queue
 import paramiko
+import socketserver
+import sys
 from gvm.connections import UnixSocketConnection
 from gvm.protocols.gmp import Gmp
 from gvm.transforms import EtreeTransform
 from prometheus_client import start_http_server, Gauge, REGISTRY
+
+# =====================================================================
+# SUPRIMARE ERORI "Connection reset by peer"
+# =====================================================================
+def silent_handle_error(self, request, client_address):
+    exc_type, exc_value, exc_traceback = sys.exc_info()
+    if issubclass(exc_type, (ConnectionResetError, BrokenPipeError)):
+        return  # Ignora eroarea in tacere
+    print(f"Eroare minora server HTTP: {exc_value}", file=sys.stderr)
+
+socketserver.BaseServer.handle_error = silent_handle_error
 
 # =====================================================================
 # LOGGING
