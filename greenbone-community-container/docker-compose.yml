@@ -335,6 +335,7 @@ services:
     volumes:
       - gvmd_socket_vol:/run/gvmd
       - /var/log/auth.log:/host_logs/auth.log:ro
+      - ov2_state_vol:/tmp/ov2_state    # <-- PERSISTENTA ADĂUGATĂ
     ports:
       - "8000:8000"
     depends_on:
@@ -407,3 +408,4 @@ volumes:
   # Volume-uri noi pentru Infisical
   infisical_pg_data:
   infisical_redis_data:
+  ov2_state_vol:    # <-- PERSISTENȚĂ ADĂUGATĂ

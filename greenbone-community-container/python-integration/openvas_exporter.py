@@ -157,16 +157,41 @@ MRBENNY_SESSION_TOKEN = None
 CISA_KEV_URL  = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 CISA_KEV_LIST = set()
 LOCAL_DEVICE_MAP = {}
-ALREADY_ALERTED  = {}
 IS_FIRST_RUN     = True
 AGENT_START_TIME = time.time()
+
+# =====================================================================
+# STATE PERSISTENT (Anti-Amnesie la restart)
+# =====================================================================
+STATE_DIR = "/tmp/ov2_state"
+ALERTED_FILE = os.path.join(STATE_DIR, "alerted.json")
+os.makedirs(STATE_DIR, exist_ok=True)
+
+def load_alert_state():
+    if os.path.exists(ALERTED_FILE):
+        try:
+            with open(ALERTED_FILE, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            log_msg(f"⚠️ Eroare la incarcare state: {e}. Incepem curat.")
+    return {}
+
+def save_alert_state():
+    try:
+        with open(ALERTED_FILE, "w") as f:
+            json.dump(ALREADY_ALERTED, f)
+    except Exception as e:
+        log_msg(f"⚠️ Eroare la salvare state: {e}")
+
+ALREADY_ALERTED = load_alert_state()
+log_msg(f"[STATE] 💾 Memorie incarcata: {len(ALREADY_ALERTED)} alerte cunoscute.")
 
 # =====================================================================
 # OPT 1: DISCORD QUEUE
 # Thread dedicat pentru trimiterea alertelor Discord.
 # Rezolva problema rate limiting si elibereaza loop-ul principal.
 # =====================================================================
-DISCORD_QUEUE        = queue.Queue(maxsize=100)
+DISCORD_QUEUE        = queue.Queue(maxsize=5000)
 DISCORD_MIN_INTERVAL = 2.0
 DISCORD_LOCK         = threading.Lock()
 DISCORD_LAST_SEND    = 0
@@ -218,7 +243,7 @@ def discord_worker():
             log_err("[DISCORD Worker]", e)
 
 def _discord_send(payload_dict):
-    """Non-blocking — adauga in coada, nu blocheza loop-ul principal."""
+    """Non-blocking — adauga in coada, nu blocheaza loop-ul principal."""
     if not DISCORD_WEBHOOK:
         return
     try:
@@ -234,7 +259,7 @@ def send_discord_alert(host, name, severity, cve, is_high, mrbenny_id,
         score = 0.0
     color        = 0x000000 if is_kev_exploited else (0xFF0000 if score >= 7.0 else 0xFF8C00)
     host_display = f"`{host}`" + (f" | 🔖 MrBenny ID: `{mrbenny_id}`" if mrbenny_id != "N/A" else "")
-    
+
     # Asiguram un SOAR ACTION si SOLUTION curat, fara newlines suplimentare nedorite in embed
     sol = solution.replace('\n', ' ') if solution else "N/A"
     act = soar_action.replace('\n', ' ') if soar_action else f"*{sol[:500]}*"
@@ -487,17 +512,21 @@ def get_openvas_data():
                             mb_id = get_or_create_mrbenny_id(host)
                             ALREADY_ALERTED[sig] = {
                                 "host": host, "name": name,
-                                "cve": cve,   "mrbenny_id": mb_id
+                                "cve": cve,   "mrbenny_id": mb_id,
+                                "missing_count": 0
                             }
                             if not IS_FIRST_RUN:
                                 new_alerts.append((host, name, sev, cve, mb_id, sol, is_kev))
+                        else:
+                            # Daca apare din nou, reseteaza contorul de debounce
+                            ALREADY_ALERTED[sig]["missing_count"] = 0
 
                     elif sev > 0:
                         unique_low.add(sig)
                 except:
                     continue
 
-            # OPT 4: Lansam SOAR async pentru fiecare alerta noua
+            # Lansam SOAR async pentru fiecare alerta noua
             for alert_data in new_alerts:
                 threading.Thread(
                     target=run_soar_async,
@@ -505,8 +534,15 @@ def get_openvas_data():
                     daemon=True
                 ).start()
 
-            resolved = set(ALREADY_ALERTED.keys()) - current_signatures
-            for s in resolved:
+            # Debounce la stergere (asteapta 3 verificari fara ea)
+            resolved_to_remove = []
+            for s in list(ALREADY_ALERTED.keys()):
+                if s not in current_signatures:
+                    ALREADY_ALERTED[s]["missing_count"] += 1
+                    if ALREADY_ALERTED[s]["missing_count"] >= 3:
+                        resolved_to_remove.append(s)
+
+            for s in resolved_to_remove:
                 v = ALREADY_ALERTED.pop(s)
                 if not IS_FIRST_RUN:
                     send_discord_resolved(v["host"], v["name"], v["cve"], v["mrbenny_id"])
@@ -517,6 +553,8 @@ def get_openvas_data():
             VULN_MEDIUM.set(len(unique_med))
             VULN_LOW.set(len(unique_low))
             VULN_KEV.set(len(unique_kev))
+
+            save_alert_state()
 
     except Exception as e:
         log_err("[OpenVAS]", e)
@@ -654,9 +692,8 @@ def monitor_hids_logs():
 if __name__ == '__main__':
     authenticate_mrbenny()
 
-    # Pornim toate thread-urile de background
-    threading.Thread(target=discord_worker,         daemon=True).start()  # OPT 1
-    threading.Thread(target=mrbenny_id_worker,      daemon=True).start()  # OPT 2
+    threading.Thread(target=discord_worker,         daemon=True).start()  
+    threading.Thread(target=mrbenny_id_worker,      daemon=True).start()  
     threading.Thread(target=mrbenny_heartbeat_loop, daemon=True).start()
     threading.Thread(target=mrbenny_ontology_loop,  daemon=True).start()
     threading.Thread(target=monitor_hids_logs,       daemon=True).start()
@@ -673,9 +710,8 @@ if __name__ == '__main__':
     while True:
         get_openvas_data()
 
-        # KEV refresh la fiecare 6 ore (720 x 30s = 6h)
         if loop % 720 == 0 and loop > 0:
             fetch_cisa_kev()
 
         loop += 1
-        time.sleep(30)  # OPT 3: 30s in loc de 5s
+        time.sleep(30)
