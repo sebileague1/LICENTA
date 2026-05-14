@@ -1,3 +1,6 @@
+import warnings
+warnings.filterwarnings("ignore")
+
 import time
 import json
 import urllib.request
@@ -8,16 +11,37 @@ import re
 import os
 import queue
 import paramiko
+import socketserver
+import sys
 from gvm.connections import UnixSocketConnection
 from gvm.protocols.gmp import Gmp
 from gvm.transforms import EtreeTransform
 from prometheus_client import start_http_server, Gauge, REGISTRY
 
 # =====================================================================
-# LOGGING
+# SUPRIMARE ERORI "Connection reset by peer"
 # =====================================================================
+def silent_handle_error(self, request, client_address):
+    exc_type, exc_value, exc_traceback = sys.exc_info()
+    if issubclass(exc_type, (ConnectionResetError, BrokenPipeError)):
+        return  # Ignora eroarea in tacere
+    print(f"Eroare minora server HTTP: {exc_value}", file=sys.stderr)
+
+socketserver.BaseServer.handle_error = silent_handle_error
+
+# =====================================================================
+# LOGGING ATOMIC CURATAT
+# =====================================================================
+PRINT_LOCK = threading.Lock()
+
 def log_msg(mesaj):
-    print(mesaj, flush=True)
+    if not mesaj:
+        return
+    mesaj_curat = str(mesaj).strip().replace('\n', ' ').replace('\r', '')
+    if mesaj_curat:
+        with PRINT_LOCK:
+            sys.stdout.write(mesaj_curat + '\n')
+            sys.stdout.flush()
 
 def log_err(context, exc):
     tip = type(exc).__name__
@@ -114,7 +138,7 @@ except Exception as e:
     log_msg(f"[STARTUP] ❌ soar_engine nu a putut fi incarcat! Motiv: {e}")
 
 # =====================================================================
-# CONFIGURARE
+# CONFIGURARE GENERALA
 # =====================================================================
 SOCKET_PATH = '/run/gvmd/gvmd.sock'
 GVMD_USER   = secret("GVMD_USER",   "admin")
@@ -131,15 +155,84 @@ MRBENNY_SESSION_TOKEN = None
 CISA_KEV_URL  = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 CISA_KEV_LIST = set()
 LOCAL_DEVICE_MAP = {}
-ALREADY_ALERTED  = {}
 IS_FIRST_RUN     = True
 AGENT_START_TIME = time.time()
 
 # =====================================================================
-# ⚡ DISCORD QUEUE - OPTIMIZED
+# CONFIGURARE TASK AUTO-DETECT
 # =====================================================================
-DISCORD_QUEUE        = queue.Queue(maxsize=100)
-DISCORD_MIN_INTERVAL = 1.0  # ⚡ MODIFICAT: 1s in loc de 2s (mai rapid)
+MONITORED_TASK_ID = os.environ.get("OPENVAS_TASK_ID", "")
+AUTO_DETECT_TASK = True
+
+def auto_detect_monitored_task():
+    """Detecteaza automat task-ul cel mai recent care ruleaza sau s-a terminat."""
+    global MONITORED_TASK_ID
+    
+    if MONITORED_TASK_ID:
+        log_msg(f"[TASK] ✅ Task monitorizat (pre-setat): {MONITORED_TASK_ID[:8]}...")
+        return
+    
+    connection = UnixSocketConnection(path=SOCKET_PATH, timeout=60.0)
+    try:
+        with Gmp(connection, transform=EtreeTransform()) as gmp:
+            gmp.authenticate(GVMD_USER, GVMD_PASS)
+            tasks = gmp.get_tasks(filter_string="rows=10")
+            
+            task_priority = []
+            for task in tasks.xpath('task'):
+                task_id = task.get('id')
+                status_elem = task.find('status')
+                status = status_elem.text if status_elem is not None else "Unknown"
+                last_report = task.find('.//last_report/report')
+                
+                if last_report is not None:
+                    priority = 0
+                    if status == "Running": priority = 100
+                    elif status == "Requested": priority = 90
+                    elif status == "Done": priority = 50
+                    task_priority.append((priority, task_id, status))
+            
+            if task_priority:
+                task_priority.sort(reverse=True, key=lambda x: x[0])
+                MONITORED_TASK_ID = task_priority[0][1]
+                log_msg(f"[TASK] 🔍 Auto-detect activat: Task {MONITORED_TASK_ID[:8]}... (Status: {task_priority[0][2]})")
+            else:
+                log_msg("[TASK] ⚠️ Niciun task gasit in OpenVAS! Se vor monitoriza toate rezultatele la gramada.")
+                
+    except Exception as e:
+        log_err("[TASK Auto-detect]", e)
+
+# =====================================================================
+# STATE PERSISTENT (Anti-Amnesie la restart)
+# =====================================================================
+STATE_DIR = "/tmp/ov2_state"
+ALERTED_FILE = os.path.join(STATE_DIR, "alerted.json")
+os.makedirs(STATE_DIR, exist_ok=True)
+
+def load_alert_state():
+    if os.path.exists(ALERTED_FILE):
+        try:
+            with open(ALERTED_FILE, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            log_msg(f"⚠️ Eroare la incarcare state: {e}. Incepem curat.")
+    return {}
+
+def save_alert_state():
+    try:
+        with open(ALERTED_FILE, "w") as f:
+            json.dump(ALREADY_ALERTED, f)
+    except Exception as e:
+        log_msg(f"⚠️ Eroare la salvare state: {e}")
+
+ALREADY_ALERTED = load_alert_state()
+log_msg(f"[STATE] 💾 Memorie incarcata: {len(ALREADY_ALERTED)} alerte cunoscute.")
+
+# =====================================================================
+# DISCORD QUEUE
+# =====================================================================
+DISCORD_QUEUE        = queue.Queue(maxsize=5000)
+DISCORD_MIN_INTERVAL = 0.5
 DISCORD_LOCK         = threading.Lock()
 DISCORD_LAST_SEND    = 0
 
@@ -166,10 +259,9 @@ def _discord_send_raw(payload_dict, retry_count=0):
         if e.code == 429:
             try:
                 body = json.loads(e.read().decode())
-                wait_time = float(body.get("retry_after", 2.0))
+                wait_time = float(body.get("retry_after", 0.5))
             except:
-                wait_time = 2.0
-            log_msg(f"[DISCORD] ⏳ Rate limited. Astept {wait_time}s...")
+                wait_time = 1.0
             time.sleep(wait_time)
             return _discord_send_raw(payload_dict, retry_count + 1)
         return False
@@ -190,7 +282,6 @@ def discord_worker():
             log_err("[DISCORD Worker]", e)
 
 def _discord_send(payload_dict):
-    """Non-blocking — adauga in coada, nu blocheza loop-ul principal."""
     if not DISCORD_WEBHOOK:
         return
     try:
@@ -198,86 +289,36 @@ def _discord_send(payload_dict):
     except queue.Full:
         log_msg("[DISCORD] ⚠️ Coada plina, mesaj ignorat.")
 
-# =====================================================================
-# 📋 DISCORD ALERTS - EXTENDED VERSION
-# =====================================================================
-def send_discord_alert_extended(host, name, severity, cve, is_high, mrbenny_id,
-                                solution, is_kev_exploited, soar_action=None,
-                                description="N/A", impact="N/A", affected="N/A"):
-    """Alerta Discord cu informatii EXTINSE despre vulnerabilitate."""
+def send_discord_alert(host, name, severity, cve, is_high, mrbenny_id,
+                       solution, description, is_kev_exploited, soar_action=None):
     try:
         score = float(severity)
     except:
         score = 0.0
-    
-    color = 0x000000 if is_kev_exploited else (0xFF0000 if score >= 7.0 else 0xFF8C00)
-    host_display = f"`{host}`"
-    if mrbenny_id != "N/A":
-        host_display += f"\n🔖 MrBenny ID: `{mrbenny_id}`"
-    
-    # Constructie fields cu informatii detaliate
-    fields = [
-        {"name": "🖥️ Host", "value": host_display, "inline": True},
-        {"name": "⚠️ CVSS", "value": f"**{severity}**", "inline": True},
-        {"name": "🏷️ CVE", "value": f"`{cve}`", "inline": False}
-    ]
-    
-    # Description (daca exista si nu e default)
-    if description and description != "N/A" and len(description) > 10:
-        fields.append({
-            "name": "📝 Descriere",
-            "value": f"*{description}*",
-            "inline": False
-        })
-    
-    # Impact (daca exista)
-    if impact and impact != "N/A" and len(impact) > 5:
-        fields.append({
-            "name": "💥 Impact",
-            "value": f"*{impact[:300]}*",
-            "inline": False
-        })
-    
-    # Affected systems (daca exista)
-    if affected and affected != "N/A" and len(affected) > 5:
-        fields.append({
-            "name": "🎯 Sisteme Afectate",
-            "value": f"*{affected[:200]}*",
-            "inline": False
-        })
-    
-    # Solution - prioritate SOAR, apoi OpenVAS
-    if soar_action:
-        fields.append({
-            "name": "🛡️ SOAR Remediation",
-            "value": soar_action,
-            "inline": False
-        })
-    else:
-        # Truncate solution daca e prea lung
-        sol_display = solution[:600] if len(solution) > 600 else solution
-        if len(solution) > 600:
-            sol_display += "\n*...vezi OpenVAS pentru detalii complete*"
-        
-        fields.append({
-            "name": "🛠️ Soluție Recomandată",
-            "value": f"*{sol_display}*",
-            "inline": False
-        })
-    
+    color        = 0x000000 if is_kev_exploited else (0xFF0000 if score >= 7.0 else 0xFF8C00)
+    host_display = f"`{host}`" + (f" | 🔖 MrBenny ID: `{mrbenny_id}`" if mrbenny_id != "N/A" else "")
+
+    desc_clean = description[:350].replace('\n', ' ') + "..." if len(description) > 350 else description.replace('\n', ' ')
+    sol_clean = solution[:350].replace('\n', ' ') + "..." if len(solution) > 350 else solution.replace('\n', ' ')
+    act_clean = soar_action.replace('\n', ' ') if soar_action else f"*{sol_clean}*"
+
     payload = {
         "content": "🚨 **VULNERABILITATE NOUĂ DETECTATĂ**" if not is_kev_exploited else "☠️ **CRITICAL KEV MATCH!**",
         "embeds": [{
-            "title": f"🔍 {name[:200]}",  # Limit title length
+            "title": f"🔍 {name}",
             "color": color,
-            "fields": fields,
-            "footer": {
-                "text": "SOC OV2 Agent | B2 Mode | Enhanced Intel"
-            },
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            "fields": [
+                {"name": "🖥️ Host",  "value": host_display,        "inline": True},
+                {"name": "⚠️ CVSS",  "value": f"**{severity}**",   "inline": True},
+                {"name": "🏷️ CVE",  "value": f"`{cve}`",           "inline": False},
+                {"name": "📖 Descriere", "value": f"_{desc_clean}_", "inline": False},
+                {"name": "🛡️ SOAR" if soar_action else "🛠️ Soluție & Mitigare",
+                 "value": act_clean,
+                 "inline": False}
+            ],
+            "footer": {"text": "SOC OV2 Agent | Trusted Mode B2 | Infisical"}
         }]
     }
-    
     _discord_send(payload)
 
 def send_discord_resolved(host, name, cve, mrbenny_id):
@@ -288,9 +329,9 @@ def send_discord_resolved(host, name, cve, mrbenny_id):
             "color": 0x00C853,
             "fields": [
                 {"name": "🖥️ Host",   "value": f"`{host}`",      "inline": True},
-                {"name": "📋 Status", "value": "Rezolvat/Șters", "inline": True}
+                {"name": "📋 Status", "value": "Rezolvat/Șters din Raport", "inline": True}
             ],
-            "footer": {"text": "SOC OV2 Agent | Incident Închis"}
+            "footer": {"text": "SOC OV2 Agent | Incident Închis | Infisical"}
         }]
     }
     _discord_send(payload)
@@ -301,11 +342,9 @@ def send_startup_message():
              else "⚠️ Env vars")
     soar_status = "✅ ACTIV" if SOAR_LOADED else "❌ EROARE"
     _discord_send({"content": (
-        "🟢 **SOC OV2 — SISTEM PORNIT (v2.0 - Enhanced)**\n"
+        "🟢 **SOC OV2 — SISTEM PORNIT (vFINAL - Optimizat)**\n"
         f"Secrete: **{sursa}** ({len(_SECRETS)} incarcate)\n"
-        f"Status SOAR: **{soar_status}**\n"
-        f"⚡ Polling interval: **10s** (optimizat)\n"
-        f"📋 Extended intel: **ENABLED**"
+        f"Status SOAR: **{soar_status}**"
     )})
 
 # =====================================================================
@@ -347,7 +386,6 @@ def authenticate_mrbenny():
         log_msg("[AUTH] ✅ Autentificare B2 REUSITA!")
         return True
     except Exception as e:
-        log_err("[AUTH]", e)
         return False
 
 def mrbenny_request(endpoint, method="GET", payload=None):
@@ -379,7 +417,7 @@ def mrbenny_heartbeat_loop():
                 "metrics": {
                     "queue_size": DISCORD_QUEUE.qsize(),
                     "uptime_seconds": uptime,
-                    "version": "2.0-enhanced"
+                    "version": "2.0"
                 }
             }
             mrbenny_request("/heartbeat", method="POST", payload=payload)
@@ -440,7 +478,7 @@ def mrbenny_id_worker():
             log_err("[MrBenny ID Worker]", e)
 
 # =====================================================================
-# MODUL: OPENVAS SYNC - ENHANCED
+# MODUL: OPENVAS SYNC (CU FILTRARE PE TASK)
 # =====================================================================
 def fetch_cisa_kev():
     global CISA_KEV_LIST
@@ -449,52 +487,49 @@ def fetch_cisa_kev():
         with urllib.request.urlopen(req, timeout=15) as response:
             data = json.loads(response.read().decode())
             CISA_KEV_LIST = {vuln["cveID"] for vuln in data.get("vulnerabilities", [])}
-        log_msg(f"[KEV] ✅ {len(CISA_KEV_LIST)} CVE-uri KEV incarcate.")
     except Exception as e:
         log_err("[KEV]", e)
 
-def run_soar_async(vuln_details):
-    """⚡ SOAR async cu date extinse."""
+def run_soar_async(host, name, sev, cve, mb_id, sol, desc, is_kev):
     try:
-        host = vuln_details['host']
-        name = vuln_details['name']
-        sev = vuln_details['sev']
-        cve = vuln_details['cve']
-        mb_id = vuln_details['mb_id']
-        sol = vuln_details['solution']
-        is_kev = vuln_details['is_kev']
-        description = vuln_details.get('description', 'N/A')
-        impact = vuln_details.get('impact', 'N/A')
-        affected = vuln_details.get('affected', 'N/A')
-        
         soar_action = None
         if SOAR_LOADED:
             soar_action = soar_engine.trigger_remediation(host, name)
-        
-        # Trimite cu info extinse
-        send_discord_alert_extended(
-            host, name, str(sev), cve, (sev >= 7.0),
-            mb_id, sol, is_kev, soar_action, 
-            description, impact, affected
-        )
+        send_discord_alert(host, name, str(sev), cve, (sev >= 7.0),
+                           mb_id, sol, desc, is_kev, soar_action)
         DEVICE_RISK.labels(ip=host).set(1)
     except Exception as e:
-        log_err(f"[SOAR Async]", e)
+        log_err(f"[SOAR Async {host}]", e)
 
 def get_openvas_data():
-    """📋 ENHANCED: Extrage date complete din OpenVAS."""
-    global IS_FIRST_RUN
+    global IS_FIRST_RUN, MONITORED_TASK_ID
     connection = UnixSocketConnection(path=SOCKET_PATH, timeout=300.0)
     try:
         with Gmp(connection, transform=EtreeTransform()) as gmp:
             gmp.authenticate(GVMD_USER, GVMD_PASS)
-            results = gmp.get_results(
-                filter_string="rows=-1 ignore_pagination=1 trash=0 apply_overrides=1"
-            )
+            
+            # FILTRAREA STRICTA PE TASK ID (Previne problemele la stergerea rapoartelor vechi)
+            if MONITORED_TASK_ID:
+                try:
+                    # Validam daca task-ul inca exista in baza de date
+                    task_info = gmp.get_task(task_id=MONITORED_TASK_ID)
+                    filter_str = f"task_id={MONITORED_TASK_ID} rows=-1 trash=0 details=1"
+                except:
+                    log_msg(f"[OV] ⚠️ Task-ul monitorizat {MONITORED_TASK_ID[:8]} nu mai exista. Cautam altul...")
+                    MONITORED_TASK_ID = ""
+                    auto_detect_monitored_task()
+                    if MONITORED_TASK_ID:
+                        filter_str = f"task_id={MONITORED_TASK_ID} rows=-1 trash=0 details=1"
+                    else:
+                        filter_str = "rows=-1 ignore_pagination=1 trash=0 apply_overrides=1 details=1"
+            else:
+                filter_str = "rows=-1 ignore_pagination=1 trash=0 apply_overrides=1 details=1"
+
+            results = gmp.get_results(filter_string=filter_str)
 
             unique_high, unique_med, unique_low, unique_kev = set(), set(), set(), set()
             current_signatures = set()
-            new_alerts_sorted = []  # ⚡ Lista cu prioritate
+            new_alerts = []
 
             for res in results.xpath('result'):
                 try:
@@ -509,46 +544,20 @@ def get_openvas_data():
                     cve_node = nvt_node.find('cve')
                     cve      = cve_node.text if cve_node is not None else "N/A"
                     sev      = float(res.find('severity').text)
+                    sig      = f"{host}|{oid}"
+
+                    desc_node = res.find('description')
+                    desc = desc_node.text.strip() if desc_node is not None and desc_node.text else "Nicio descriere detaliata."
                     
-                    # 📋 EXTRAGERE INFO DETALIATE DIN OPENVAS
-                    description_elem = res.find('description')
-                    description = description_elem.text if description_elem is not None else ""
+                    sol = ""
+                    tags_node = nvt_node.find('tags')
+                    if tags_node is not None and tags_node.text:
+                        m_sol = re.search(r'solution=([^|]+)', tags_node.text)
+                        if m_sol:
+                            sol = m_sol.group(1).strip()
                     
-                    # Parsare solution din description (format OpenVAS)
-                    sol = "Vezi OpenVAS pentru detalii"
-                    impact = ""
-                    affected = ""
-                    
-                    if description:
-                        # OpenVAS pune solutia dupa "Solution:\n"
-                        if "Solution:" in description:
-                            parts = description.split("Solution:")
-                            if len(parts) > 1:
-                                sol_text = parts[1].split("\n\n")[0].strip()
-                                # Curata formatari speciale
-                                sol_text = sol_text.replace("Solution type: ", "")
-                                sol = sol_text[:500] if sol_text else "Nicio soluție specificată"
-                        
-                        # Extract Impact
-                        if "Impact:" in description:
-                            impact_parts = description.split("Impact:")
-                            if len(impact_parts) > 1:
-                                impact = impact_parts[1].split("\n\n")[0].strip()[:300]
-                        
-                        # Extract Affected
-                        if "Affected Software/OS:" in description:
-                            affected_parts = description.split("Affected Software/OS:")
-                            if len(affected_parts) > 1:
-                                affected = affected_parts[1].split("\n\n")[0].strip()[:200]
-                        elif "Affected:" in description:
-                            affected_parts = description.split("Affected:")
-                            if len(affected_parts) > 1:
-                                affected = affected_parts[1].split("\n\n")[0].strip()[:200]
-                    
-                    # Summary pentru description (primele 250 chars)
-                    desc_summary = description[:250].replace("\n", " ").strip() if description else "N/A"
-                    
-                    sig = f"{host}|{oid}"
+                    if not sol:
+                        sol = "Investigatie manuala necesara. Verifica panoul Greenbone."
 
                     if sev >= 4.0:
                         current_signatures.add(sig)
@@ -563,52 +572,37 @@ def get_openvas_data():
 
                         if sig not in ALREADY_ALERTED:
                             mb_id = get_or_create_mrbenny_id(host)
+                            
                             ALREADY_ALERTED[sig] = {
                                 "host": host, "name": name,
-                                "cve": cve,   "mrbenny_id": mb_id
+                                "cve": cve,   "mrbenny_id": mb_id,
+                                "missing_count": 0
                             }
                             if not IS_FIRST_RUN:
-                                # ⚡ PRIORITATE: KEV=100, High=10, Medium=1
-                                priority = 100 if is_kev else (10 if sev >= 7.0 else 1)
-                                
-                                # Dict cu toate datele extinse
-                                vuln_details = {
-                                    'host': host,
-                                    'name': name,
-                                    'sev': sev,
-                                    'cve': cve,
-                                    'mb_id': mb_id,
-                                    'solution': sol,
-                                    'is_kev': is_kev,
-                                    'description': desc_summary,
-                                    'impact': impact,
-                                    'affected': affected
-                                }
-                                new_alerts_sorted.append((priority, vuln_details))
+                                new_alerts.append((host, name, sev, cve, mb_id, sol, desc, is_kev))
+                        else:
+                            ALREADY_ALERTED[sig]["missing_count"] = 0
 
                     elif sev > 0:
                         unique_low.add(sig)
-                except Exception as parse_err:
-                    log_err("[Parse Result]", parse_err)
+                except:
                     continue
 
-            # ⚡ PRIORITATE: Sortare descrescătoare (High/KEV primele)
-            new_alerts_sorted.sort(reverse=True, key=lambda x: x[0])
-            
-            # Lansam SOAR async pentru fiecare alerta (in ordinea prioritatii)
-            for alert_data in new_alerts_sorted:
-                priority = alert_data[0]
-                vuln_details = alert_data[1]
+            for alert_data in new_alerts:
                 threading.Thread(
                     target=run_soar_async,
-                    args=(vuln_details,),
+                    args=alert_data,
                     daemon=True
                 ).start()
-                time.sleep(0.1)  # Delay mic pentru ordine
 
-            # Detectare remedieri
-            resolved = set(ALREADY_ALERTED.keys()) - current_signatures
-            for s in resolved:
+            resolved_to_remove = []
+            for s in list(ALREADY_ALERTED.keys()):
+                if s not in current_signatures:
+                    ALREADY_ALERTED[s]["missing_count"] += 1
+                    if ALREADY_ALERTED[s]["missing_count"] >= 3:
+                        resolved_to_remove.append(s)
+
+            for s in resolved_to_remove:
                 v = ALREADY_ALERTED.pop(s)
                 if not IS_FIRST_RUN:
                     send_discord_resolved(v["host"], v["name"], v["cve"], v["mrbenny_id"])
@@ -620,7 +614,7 @@ def get_openvas_data():
             VULN_LOW.set(len(unique_low))
             VULN_KEV.set(len(unique_kev))
 
-            log_msg(f"[OV] 📊 H:{len(unique_high)} M:{len(unique_med)} L:{len(unique_low)} KEV:{len(unique_kev)} | Alerte noi: {len(new_alerts_sorted)}")
+            save_alert_state()
 
     except Exception as e:
         log_err("[OpenVAS]", e)
@@ -649,7 +643,7 @@ def execute_quarantine(ip):
         if exit_code == 0:
             log_msg(f"[SOAR] 🧱 IP {ip} BLOCAT pe SSH. Deblocare in 60s.")
         else:
-            log_msg(f"[SOAR] ⚠️ Blocare {ip} exit code {exit_code}")
+            log_msg(f"[SOAR] ⚠️ Blocare {ip} exit code {exit_code}: {stderr.read().decode().strip()}")
     except Exception as e:
         log_err(f"[SOAR] Blocare SSH {ip}", e)
         time.sleep(60)
@@ -673,12 +667,13 @@ def execute_quarantine(ip):
         stdin, stdout, stderr = client.exec_command(unblock_cmd)
         stdout.channel.recv_exit_status()
         client.close()
-        log_msg(f"[SOAR] 🟢 IP {ip} DEBLOCAT dupa 60s.")
+        log_msg(f"[SOAR] 🟢 IP {ip} DEBLOCAT GARANTAT dupa 60s.")
     except Exception as e:
         log_err(f"[SOAR] Deblocare SSH {ip}", e)
     finally:
         with QUARANTINE_LOCK:
             atacatori_cunoscuti[ip] = 0
+        log_msg(f"[SOAR] 🔄 Stare resetata pentru {ip}.")
 
 def monitor_hids_logs():
     log_file = "/host_logs/auth.log"
@@ -739,36 +734,14 @@ def monitor_hids_logs():
             if nou_count >= 3:
                 atacatori_cunoscuti[ip] = "BLOCKED"
                 mb_id = get_or_create_mrbenny_id(ip)
+                msg = f"🛡️ **SOAR HIDS:** IP `{ip}` blocat SSH 60s. (Tentative: **{nou_count}**)"
                 
-                # Alertă HIDS cu info extinse
-                vuln_details = {
-                    'host': "Ubuntu Host",
-                    'name': "SSH Brute Force (HIDS)",
-                    'sev': 10.0,
-                    'cve': "N/A",
-                    'mb_id': mb_id,
-                    'solution': f"IP {ip} blocat automat 60s",
-                    'is_kev': False,
-                    'description': f"Detectate {nou_count} tentative SSH esuate",
-                    'impact': "Acces neautorizat potential la sistem",
-                    'affected': f"SSH port 22 de la {ip}"
-                }
-                
-                send_discord_alert_extended(
-                    vuln_details['host'],
-                    vuln_details['name'],
-                    str(vuln_details['sev']),
-                    vuln_details['cve'],
-                    True,
-                    vuln_details['mb_id'],
-                    vuln_details['solution'],
-                    False,
-                    f"🛡️ SOAR ACTIV: Blocare automată {ip}",
-                    vuln_details['description'],
-                    vuln_details['impact'],
-                    vuln_details['affected']
+                log_msg(f"[SOAR] 🚨 BLOCARE INITIATA pentru {ip} ({nou_count} fail-uri)")
+                send_discord_alert(
+                    "Ubuntu Host", "SSH Brute Force (HIDS)",
+                    "10.0", "N/A", True, mb_id,
+                    "Carantina SSH (60s)", "Fără descriere.", False, msg
                 )
-                
                 threading.Thread(target=execute_quarantine, args=(ip,), daemon=True).start()
             else:
                 atacatori_cunoscuti[ip] = nou_count
@@ -779,31 +752,29 @@ def monitor_hids_logs():
 if __name__ == '__main__':
     authenticate_mrbenny()
 
-    # Pornim toate thread-urile de background
-    threading.Thread(target=discord_worker,         daemon=True).start()
-    threading.Thread(target=mrbenny_id_worker,      daemon=True).start()
+    if AUTO_DETECT_TASK:
+        auto_detect_monitored_task()
+
+    threading.Thread(target=discord_worker,         daemon=True).start()  
+    threading.Thread(target=mrbenny_id_worker,      daemon=True).start()  
     threading.Thread(target=mrbenny_heartbeat_loop, daemon=True).start()
     threading.Thread(target=mrbenny_ontology_loop,  daemon=True).start()
-    threading.Thread(target=monitor_hids_logs,      daemon=True).start()
+    threading.Thread(target=monitor_hids_logs,       daemon=True).start()
 
     fetch_cisa_kev()
     send_startup_message()
 
     try:
         start_http_server(8000)
-        log_msg("[PROMETHEUS] ✅ Server HTTP pornit pe :8000")
     except Exception as e:
         log_err("[PROMETHEUS]", e)
 
-    log_msg("[MAIN] ⚡ Loop principal pornit (interval 10s)")
     loop = 0
     while True:
         get_openvas_data()
 
-        # KEV refresh la fiecare 6 ore (720 x 10s = 2h) - ajustat pentru interval 10s
-        # Noua formula: 6h = 21600s / 10s = 2160 iteratii
-        if loop % 2160 == 0 and loop > 0:
+        if loop % 720 == 0 and loop > 0:
             fetch_cisa_kev()
 
         loop += 1
-        time.sleep(10)  # ⚡ MODIFICAT: 10s in loc de 30s (de 3x mai rapid)
+        time.sleep(15)
