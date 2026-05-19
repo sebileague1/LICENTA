@@ -129,6 +129,7 @@ CISA_KEV_LIST = set()
 LOCAL_DEVICE_MAP = {}
 IS_FIRST_RUN = True
 AGENT_START_TIME = time.time()
+GLOBAL_EMPTY_CYCLES = 0 # SCUTUL ANTI-FLAPPING GLOBAL
 
 # =====================================================================
 # STATE PERSISTENT 
@@ -235,7 +236,7 @@ def send_discord_resolved(host, name, cve):
 def send_startup_message():
     soar_status = "✅ ACTIV" if SOAR_LOADED else "❌ EROARE"
     _discord_send({"content": (
-        "🟢 **SOC OV2 — SISTEM PORNIT (vFINAL - Stable)**\n"
+        "🟢 **SOC OV2 — SISTEM PORNIT (vFINAL - Instant Resolve)**\n"
         f"Status SOAR: **{soar_status}**\n"
         f"⚡ Polling interval: **10s**"
     )})
@@ -310,7 +311,7 @@ def mrbenny_id_worker():
         except: continue
 
 # =====================================================================
-# MODUL: OPENVAS SYNC (REPARAT - CU DEBOUNCE)
+# MODUL: OPENVAS SYNC (REPARAT COMPLET - INSTANT RESOLVE)
 # =====================================================================
 def fetch_cisa_kev():
     global CISA_KEV_LIST
@@ -337,23 +338,33 @@ def run_soar_async(vuln_details):
     except: pass
 
 def get_openvas_data():
-    global IS_FIRST_RUN
+    global IS_FIRST_RUN, GLOBAL_EMPTY_CYCLES
     connection = UnixSocketConnection(path=SOCKET_PATH, timeout=300.0)
     try:
         with Gmp(connection, transform=EtreeTransform()) as gmp:
             gmp.authenticate(GVMD_USER, GVMD_PASS)
             
-            try:
-                results = gmp.get_results(filter_string="rows=-1 ignore_pagination=1 trash=0 apply_overrides=1 details=1")
-            except Exception as db_err:
-                log_msg(f"[OV] ⏳ Baza de date OpenVAS este ocupata (posibil stergere rapoarte). Asteptam...")
-                return # Abort - previne stergerea memoriei daca baza de date pica momentan
+            results = gmp.get_results(filter_string="rows=-1 ignore_pagination=1 trash=0 apply_overrides=1 details=1")
+            results_list = results.xpath('result')
+
+            # --- SCUT GLOBAL ANTI-FLAPPING ---
+            # Daca OpenVAS returneaza 0 rezultate brusc, asteptam 40s (4 verificari a cate 10s)
+            # ca sa fim siguri ca nu este doar blocat de la stergerea unui raport greu.
+            if len(results_list) == 0 and len(ALREADY_ALERTED) > 0:
+                GLOBAL_EMPTY_CYCLES += 1
+                if GLOBAL_EMPTY_CYCLES < 4:
+                    log_msg(f"[OV] ⏳ Baza de date OpenVAS este ocupata (0 rezultate). Asteptam... ({GLOBAL_EMPTY_CYCLES}/3)")
+                    return # Iesim fara sa stergem nimic din memorie
+                else:
+                    log_msg(f"[OV] 🗑️ Baza de date este confirmata goala. Stergem toate alertele.")
+            else:
+                GLOBAL_EMPTY_CYCLES = 0 # Resetam scutul daca primim rezultate
 
             unique_high, unique_med, unique_low, unique_kev = set(), set(), set(), set()
             current_signatures = set()
             new_alerts_sorted = []
 
-            for res in results.xpath('result'):
+            for res in results_list:
                 try:
                     host = res.find('host').text or "unknown"
                     if host == "unknown": continue
@@ -364,9 +375,10 @@ def get_openvas_data():
                     cve = nvt.find('cve').text if nvt.find('cve') is not None else "N/A"
                     sev = float(res.find('severity').text)
                     sig = f"{host}|{oid}"
+                    
+                    current_signatures.add(sig)
 
                     if sev >= 4.0:
-                        current_signatures.add(sig)
                         if sev >= 7.0: unique_high.add(sig)
                         else: unique_med.add(sig)
                         is_kev = (cve in CISA_KEV_LIST and cve != "N/A")
@@ -374,7 +386,7 @@ def get_openvas_data():
 
                         if sig not in ALREADY_ALERTED:
                             mb_id = get_or_create_mrbenny_id(host)
-                            ALREADY_ALERTED[sig] = {"host": host, "name": name, "cve": cve, "missing_count": 0}
+                            ALREADY_ALERTED[sig] = {"host": host, "name": name, "cve": cve}
                             
                             if not IS_FIRST_RUN:
                                 desc_node = res.find('description')
@@ -388,37 +400,23 @@ def get_openvas_data():
                                 priority = 100 if is_kev else (10 if sev >= 7.0 else 1)
                                 vuln_details = {'host': host, 'name': name, 'sev': sev, 'cve': cve, 'mb_id': mb_id, 'solution': sol, 'is_kev': is_kev, 'description': desc.replace("\n", " "), 'impact': "", 'affected': ""}
                                 new_alerts_sorted.append((priority, vuln_details))
-                        else:
-                            # Daca e in memorie, resetam contorul de "lipsa" la zero (s-a intors)
-                            ALREADY_ALERTED[sig]["missing_count"] = 0
                     elif sev > 0:
                         unique_low.add(sig)
                 except: continue
 
-            # Trimitem alerte noi
-            new_alerts_sorted.sort(reverse=True, key=lambda x: x[0])
-            for alert_data in new_alerts_sorted:
-                threading.Thread(target=run_soar_async, args=(alert_data[1],), daemon=True).start()
-
-            # --- LOGICA DEBOUNCE PENTRU STERGEREA RAPOARTELOR ---
-            resolved_to_remove = []
-            for s in list(ALREADY_ALERTED.keys()):
-                if s not in current_signatures:
-                    ALREADY_ALERTED[s]["missing_count"] += 1
-                    miss_cnt = ALREADY_ALERTED[s]["missing_count"]
-                    
-                    if miss_cnt == 1:
-                        log_msg(f"[DEBOUNCE] ⏳ Alerta '{ALREADY_ALERTED[s]['name'][:30]}...' nu a fost gasita. Asteptam confirmarea (1/3)")
-                    elif miss_cnt >= 3:
-                        log_msg(f"[DEBOUNCE] 🗑️ Confirmare: Alerta stearsa definitiv: {ALREADY_ALERTED[s]['name'][:30]}...")
-                        resolved_to_remove.append(s)
-
-            # Acum trimitem alertele de REZOLVAT pe Discord doar pt cele care au stat 3 cicluri absente
+            # --- REZOLVARE INSTANTA (Fara intarzieri / Fara numarat per-alerta) ---
+            resolved_to_remove = set(ALREADY_ALERTED.keys()) - current_signatures
             for s in resolved_to_remove:
                 v = ALREADY_ALERTED.pop(s)
                 if not IS_FIRST_RUN:
                     send_discord_resolved(v["host"], v["name"], v["cve"])
                     DEVICE_RISK.labels(ip=v["host"]).set(0)
+                    log_msg(f"[OV] 🗑️ Alerta stearsa/rezolvata instant: {v['name'][:30]}...")
+
+            # Trimitem alerte noi in ordine prioritizata
+            new_alerts_sorted.sort(reverse=True, key=lambda x: x[0])
+            for alert_data in new_alerts_sorted:
+                threading.Thread(target=run_soar_async, args=(alert_data[1],), daemon=True).start()
 
             IS_FIRST_RUN = False
             VULN_HIGH.set(len(unique_high)); VULN_MEDIUM.set(len(unique_med))
@@ -428,7 +426,7 @@ def get_openvas_data():
     except Exception as e: log_err("[OpenVAS]", e)
 
 # =====================================================================
-# MODUL: HIDS & SOAR
+# MODUL: HIDS & SOAR (INTACT)
 # =====================================================================
 QUARANTINE_LOCK     = threading.Lock()
 atacatori_cunoscuti = {}
