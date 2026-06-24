@@ -18,9 +18,6 @@ from gvm.protocols.gmp import Gmp
 from gvm.transforms import EtreeTransform
 from prometheus_client import start_http_server, Gauge, REGISTRY
 
-# =====================================================================
-# SUPRIMARE ERORI "Connection reset by peer"
-# =====================================================================
 def silent_handle_error(self, request, client_address):
     exc_type, exc_value, exc_traceback = sys.exc_info()
     if issubclass(exc_type, (ConnectionResetError, BrokenPipeError)):
@@ -29,9 +26,6 @@ def silent_handle_error(self, request, client_address):
 
 socketserver.BaseServer.handle_error = silent_handle_error
 
-# =====================================================================
-# LOGGING ATOMIC CURATAT
-# =====================================================================
 PRINT_LOCK = threading.Lock()
 
 def log_msg(mesaj):
@@ -45,9 +39,6 @@ def log_msg(mesaj):
 def log_err(context, exc):
     log_msg(f"{context} ❌ EROARE [{type(exc).__name__}]: {exc}")
 
-# =====================================================================
-# INFISICAL — SMART FETCHER
-# =====================================================================
 def load_secrets_from_infisical():
     secrets = {}
     infisical_url = os.environ.get("INFISICAL_URL", "")
@@ -129,11 +120,8 @@ CISA_KEV_LIST = set()
 LOCAL_DEVICE_MAP = {}
 IS_FIRST_RUN = True
 AGENT_START_TIME = time.time()
-GLOBAL_EMPTY_CYCLES = 0 # SCUTUL ANTI-FLAPPING GLOBAL
+GLOBAL_EMPTY_CYCLES = 0
 
-# =====================================================================
-# STATE PERSISTENT 
-# =====================================================================
 STATE_DIR = "/app/state"
 ALERTED_FILE = os.path.join(STATE_DIR, "alerted.json")
 os.makedirs(STATE_DIR, exist_ok=True)
@@ -152,9 +140,6 @@ def save_alert_state():
 
 ALREADY_ALERTED = load_alert_state()
 
-# =====================================================================
-# DISCORD QUEUE & WORKER
-# =====================================================================
 DISCORD_QUEUE        = queue.Queue(maxsize=5000)
 DISCORD_MIN_INTERVAL = 0.5
 DISCORD_LOCK         = threading.Lock()
@@ -241,9 +226,6 @@ def send_startup_message():
         f"⚡ Polling interval: **10s**"
     )})
 
-# =====================================================================
-# MR. BENNY INTEGRATION
-# =====================================================================
 def authenticate_mrbenny():
     global MRBENNY_SESSION_TOKEN
     try:
@@ -310,9 +292,6 @@ def mrbenny_id_worker():
             MRBENNY_ID_QUEUE.task_done()
         except: continue
 
-# =====================================================================
-# MODUL: OPENVAS SYNC (REPARAT COMPLET - INSTANT RESOLVE)
-# =====================================================================
 def fetch_cisa_kev():
     global CISA_KEV_LIST
     try:
@@ -347,18 +326,15 @@ def get_openvas_data():
             results = gmp.get_results(filter_string="rows=-1 ignore_pagination=1 trash=0 apply_overrides=1 details=1")
             results_list = results.xpath('result')
 
-            # --- SCUT GLOBAL ANTI-FLAPPING ---
-            # Daca OpenVAS returneaza 0 rezultate brusc, asteptam 40s (4 verificari a cate 10s)
-            # ca sa fim siguri ca nu este doar blocat de la stergerea unui raport greu.
             if len(results_list) == 0 and len(ALREADY_ALERTED) > 0:
                 GLOBAL_EMPTY_CYCLES += 1
                 if GLOBAL_EMPTY_CYCLES < 4:
                     log_msg(f"[OV] ⏳ Baza de date OpenVAS este ocupata (0 rezultate). Asteptam... ({GLOBAL_EMPTY_CYCLES}/3)")
-                    return # Iesim fara sa stergem nimic din memorie
+                    return
                 else:
                     log_msg(f"[OV] 🗑️ Baza de date este confirmata goala. Stergem toate alertele.")
             else:
-                GLOBAL_EMPTY_CYCLES = 0 # Resetam scutul daca primim rezultate
+                GLOBAL_EMPTY_CYCLES = 0
 
             unique_high, unique_med, unique_low, unique_kev = set(), set(), set(), set()
             current_signatures = set()
@@ -404,7 +380,6 @@ def get_openvas_data():
                         unique_low.add(sig)
                 except: continue
 
-            # --- REZOLVARE INSTANTA (Fara intarzieri / Fara numarat per-alerta) ---
             resolved_to_remove = set(ALREADY_ALERTED.keys()) - current_signatures
             for s in resolved_to_remove:
                 v = ALREADY_ALERTED.pop(s)
@@ -413,7 +388,6 @@ def get_openvas_data():
                     DEVICE_RISK.labels(ip=v["host"]).set(0)
                     log_msg(f"[OV] 🗑️ Alerta stearsa/rezolvata instant: {v['name'][:30]}...")
 
-            # Trimitem alerte noi in ordine prioritizata
             new_alerts_sorted.sort(reverse=True, key=lambda x: x[0])
             for alert_data in new_alerts_sorted:
                 threading.Thread(target=run_soar_async, args=(alert_data[1],), daemon=True).start()
@@ -425,9 +399,6 @@ def get_openvas_data():
 
     except Exception as e: log_err("[OpenVAS]", e)
 
-# =====================================================================
-# MODUL: HIDS & SOAR (INTACT)
-# =====================================================================
 QUARANTINE_LOCK     = threading.Lock()
 atacatori_cunoscuti = {}
 
@@ -515,9 +486,6 @@ def monitor_hids_logs():
             else:
                 atacatori_cunoscuti[ip] = nou_count
 
-# =====================================================================
-# MAIN
-# =====================================================================
 if __name__ == '__main__':
     authenticate_mrbenny()
 

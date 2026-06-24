@@ -1,15 +1,12 @@
 import paramiko
 import time
 
-# =====================================================================
-# CONFIGURARE RETEA
-# =====================================================================
 VALID_TRIGGER_IPS = [
-    "172.17.0.1",       # Gateway bridge docker0
-    "172.17.0.2",       # Metasploitable2 direct
-    "172.19.0.1",       # Gateway bridge retea Greenbone
-    "192.168.128.181",  # Ubuntu host fizic
-    "172.19.0.100",     # Metasploitable2 IP static
+    "172.17.0.1",
+    "172.17.0.2",
+    "172.19.0.1",
+    "192.168.128.181",
+    "172.19.0.100",
 ]
 
 SSH_HOST    = "172.19.0.100"
@@ -17,9 +14,6 @@ SSH_PORT    = 22
 TARGET_USER = "msfadmin"
 TARGET_PASS = "msfadmin"
 
-# =====================================================================
-# FUNCTII SOAR
-# =====================================================================
 def log_soar(msg):
     print(f"[SOAR] {msg}", flush=True)
 
@@ -58,7 +52,6 @@ def execute_ftp_mitigation(target_ip):
 
         log_soar("⚙️ Executie comenzi mitigare...")
 
-        # Comenzi agresive de oprire FTP
         commands = [
             f"echo '{TARGET_PASS}' | sudo -S service vsftpd stop 2>/dev/null",
             f"echo '{TARGET_PASS}' | sudo -S service proftpd stop 2>/dev/null",
@@ -72,14 +65,13 @@ def execute_ftp_mitigation(target_ip):
         for cmd in commands:
             try:
                 stdin, stdout, stderr = client.exec_command(cmd, timeout=5)
-                stdout.channel.recv_exit_status()  # Wait for completion
+                stdout.channel.recv_exit_status()
                 time.sleep(0.3)
             except Exception as cmd_err:
                 log_soar(f"⚠️ Comanda esuata (continuu): {cmd_err}")
 
-        time.sleep(2)  # Asteptare stabilizare
+        time.sleep(2)
 
-        # Post-check
         if verify_ftp_stopped(client):
             log_soar(f"✅ CONFIRMAT: Port 21 oprit pe {target_ip}")
             client.close()
@@ -110,8 +102,6 @@ def trigger_remediation(ip_sursa_alerta, vuln_name):
         log_soar(f"⏭️ IP {ip_sursa_alerta} NU e in VALID_TRIGGER_IPS - Ignorat")
         return None
 
-    # ========== PATTERN MATCHING FLEXIBLE ==========
-    # FTP Vulnerabilities - orice vulnerabilitate FTP activeaza remedierea
     ftp_keywords = [
         "ftp",
         "vsftpd",
@@ -119,13 +109,11 @@ def trigger_remediation(ip_sursa_alerta, vuln_name):
         "file transfer protocol"
     ]
     
-    # Check daca e vulnerabilitate FTP
     is_ftp_vuln = any(keyword in vuln_lower for keyword in ftp_keywords)
     
-    # Exceptii - FTP-uri pe care NU vrem sa le remedieze automat
     ftp_exceptions = [
-        "ftp server detection",  # Doar detectie, nu vuln
-        "ftp bounce",            # Alt tip de atac
+        "ftp server detection",
+        "ftp bounce",
     ]
     
     is_exception = any(exception in vuln_lower for exception in ftp_exceptions)
@@ -135,11 +123,9 @@ def trigger_remediation(ip_sursa_alerta, vuln_name):
         log_soar(f"📝 Pattern match: {vuln_name}")
         return execute_ftp_mitigation(ip_sursa_alerta)
     
-    # SSH Vulnerabilities - doar logging, fara remediere (anti-lockout)
     if "ssh" in vuln_lower:
         log_soar("🔒 Politica SSH: Remediere DEZACTIVATA (Anti-Lockout)")
         return "🛡️ **POLITICA:** SSH remediation disabled (Anti-Lockout)."
     
-    # Alte vulnerabilitati - momentan fara actiune
     log_soar(f"ℹ️ Niciun playbook disponibil pentru: {vuln_name[:60]}")
     return None

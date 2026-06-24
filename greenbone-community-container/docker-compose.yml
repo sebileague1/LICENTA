@@ -270,9 +270,6 @@ services:
       - gvmd
       - ospd-openvas
 
-  # =====================================================================
-  # INFISICAL — SECRET MANAGER (self-hosted)
-  # =====================================================================
 
   infisical-db:
     image: postgres:14-alpine
@@ -302,28 +299,20 @@ services:
       NODE_ENV: production
       DB_CONNECTION_URI: postgresql://infisical:infisicalpass@infisical-db:5432/infisical
       REDIS_URL: redis://infisical-redis:6379
-      # Chei generate cu openssl rand
       ENCRYPTION_KEY: 8a645916fc7204d143027a5ca506a255
       AUTH_SECRET: VmscD7eiKH6McvHKQOytbYjE+cpEdx2pen0ZdsUldPQ=
 
-  # =====================================================================
-  # MONITORIZARE INTEGRATA & HIDS
-  # =====================================================================
 
   openvas-exporter:
     build: ./python-integration
     restart: unless-stopped
     environment:
       - TZ=Europe/Bucharest
-      # --- INFISICAL CONEXIUNE ---
-      # Dupa ce creezi Machine Identity in Infisical UI,
-      # inlocuieste valorile de mai jos:
       - INFISICAL_URL=http://infisical:8080
       - INFISICAL_CLIENT_ID=0c5560d9-bd4c-4fc0-8d0e-3d294139e9a1
       - INFISICAL_CLIENT_SECRET=5d27b67097b86052fa21c21e1d27b7da0e3ed433a5b64be27a66263ef58b3be2
       - INFISICAL_PROJECT_ID=f369fb60-5608-4276-aac9-b8556d4c274d
       - INFISICAL_ENV=production
-      # --- FALLBACK (folosit daca Infisical nu raspunde) ---
       - DISCORD_WEBHOOK=https://discord.com/api/webhooks/1497292182674210858/qW31k6n-JgH91y6_XrcjGWQCh2POTTnp3OMMhJrUJ0-U3yZgQQxhrBP9oroBgsepiV4g
       - HOST_UBUNTU_IP=192.168.128.181
       - HOST_UBUNTU_USER=ubuntu24
@@ -335,7 +324,7 @@ services:
     volumes:
       - gvmd_socket_vol:/run/gvmd
       - /var/log/auth.log:/host_logs/auth.log:ro
-      - ov2_state_vol:/tmp/ov2_state    # <-- PERSISTENTA ADĂUGATĂ
+      - ov2_state_vol:/tmp/ov2_state
     ports:
       - "8000:8000"
     depends_on:
@@ -363,7 +352,6 @@ services:
     depends_on:
       - prometheus
 
-  # --- SIEM LOGGING (Loki + Promtail) ---
 
   loki:
     image: grafana/loki:latest
@@ -405,7 +393,6 @@ volumes:
   nginx_certificates_vol:
   prometheus_data_vol:
   grafana_data_vol:
-  # Volume-uri noi pentru Infisical
   infisical_pg_data:
   infisical_redis_data:
-  ov2_state_vol:    # <-- PERSISTENȚĂ ADĂUGATĂ
+  ov2_state_vol:
